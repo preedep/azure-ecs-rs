@@ -1,1 +1,1 @@
-RUST_LOG=debug cargo run --examples mail
+RUST_LOG=debug cargo run --example mail
