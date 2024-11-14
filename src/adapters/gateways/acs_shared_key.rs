@@ -181,10 +181,10 @@ mod tests {
         let request_id = "request-id";
         let json_payload = "{}";
         let access_key = "c2VjcmV0"; // base64 for "secret"
-        let headers = get_request_header(&url, http_method, request_id, json_payload, access_key).unwrap();
+        let headers =
+            get_request_header(&url, http_method, request_id, json_payload, access_key).unwrap();
         assert!(headers.contains_key("Authorization"));
     }
-
 
     /// Tests that `get_request_header` returns an error for an invalid access key.
     #[test]

@@ -101,3 +101,33 @@ How to use the library:
 
     let resp_send_email = acs_client.send_email(&email_request).await;
 ```
+
+- Get Email Status
+```rust
+    let resp_send_email = acs_client.send_email(&email_request).await;
+    match resp_send_email {
+        Ok(message_resp_id) => {
+            info!("Email was sent with message id: {}", message_resp_id);
+            loop {
+                tokio::time::sleep(time::Duration::from_secs(5)).await;
+                let resp_status = acs_client.get_email_status(&message_resp_id).await;
+                if let Ok(status) = resp_status {
+                    info!("{}\r\n", status.to_string());
+                    if matches!(
+                        status,
+                        EmailSendStatusType::Unknown
+                            | EmailSendStatusType::Canceled
+                            | EmailSendStatusType::Failed
+                            | EmailSendStatusType::Succeeded
+                    ) {
+                        break;
+                    }
+                } else {
+                    error!("Error getting email status: {:?}", resp_status);
+                    break;
+                }
+            }
+        }
+        Err(e) => error!("Error sending email: {:?}", e),
+    }
+```
