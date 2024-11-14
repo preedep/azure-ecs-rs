@@ -1,13 +1,14 @@
 use log::{debug, error, info};
 use std::{env, time};
 
-
+use azure_ecs_rs::adapters::gateways::acs_email::ACSClientBuilder;
+use azure_ecs_rs::domain::entities::models::{
+    EmailAddress, EmailContent, EmailSendStatusType, Recipients, SentEmailBuilder,
+};
 use clap::{Parser, ValueEnum};
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
-use azure_ecs_rs::adapters::gateways::acs_email::ACSClientBuilder;
-use azure_ecs_rs::domain::entities::models::{EmailAddress, EmailContent, EmailSendStatusType, Recipients, SentEmailBuilder};
 
 /// Enum representing the authentication methods for the CLI.
 #[derive(Debug, Clone, ValueEnum)]
@@ -216,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 recipient.as_str(),
                 display_name.as_str(),
             )
-                .await;
+            .await;
         }
         CLIACSProtocol::SMTP => {
             info!("Sending email using SMTP");
@@ -233,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 smtp_user.as_str(),
                 smtp_password.as_str(),
             )
-                .await;
+            .await;
         }
     }
 
