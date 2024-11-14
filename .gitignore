@@ -25,3 +25,6 @@ Cargo.lock
 /target
 /.idea/material_theme_project_new.xml
 /.idea/.gitignore
+/.idea/azure-ecs-rs.iml
+/.idea/modules.xml
+/.idea/vcs.xml
