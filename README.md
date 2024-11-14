@@ -3,8 +3,6 @@
 This is a Rust library for interacting with the Azure Email Communication Service (ECS) API.
 [Azure Communication Service - Email - Rest API](https://learn.microsoft.com/en-us/rest/api/communication/email/send?tabs=HTTP)
 
-My example code is in the `examples` directory. You can run the examples with:
-
 Before running the examples, you need to set the following environment variables:
 
 ```aiignore
@@ -28,7 +26,7 @@ TENANT_ID="xxx"
 ASC_URL="https://xxxxx.asiapacific.communication.azure.com"
 
 ```
-
+My example code is in the `examples` directory. You can run the examples with:
 ```sh
 RUST_LOG=debug cargo run --example mail
 ```
