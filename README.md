@@ -5,6 +5,9 @@ For more information, see the [Azure Communication Services documentation](https
 
 This crate provides a Rust client library for the Azure Email Communication Service. It supports the following features:
 [Azure Communication Service - Email - Rest API](https://learn.microsoft.com/en-us/rest/api/communication/email/send?tabs=HTTP)
+
+
+Core Features
 - Send Email
 - Get Email Status
 
@@ -45,6 +48,14 @@ RUST_LOG=debug cargo run --example mail
 ```
 How to use the library:
 - Shared Key
+
+- Get from Azure Portal
+  - CONNECTION_STR
+    ![Alt text](https://github.com/preedep/rust_azure_email_communication/blob/develop/images/image2.png "Connection String")
+  - SENDER
+    ![Alt text](https://github.com/preedep/rust_azure_email_communication/blob/develop/images/image1.png "Sender")
+
+
 ```rust
  let connection_str = get_env_var("CONNECTION_STR");
  let acs_client_builder = ACSClientBuilder::new().connection_string(connection_str.as_str())
