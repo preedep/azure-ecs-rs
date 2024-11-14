@@ -2,7 +2,7 @@
 // This file is part of the Azure Communication Services Email Client Library, an open-source project.
 // This source code is licensed under the MIT license found in the LICENSE file in the root directory of this source tree.
 
-use crate::adapters::gateways::acs_shared_key::{get_request_header, parse_endpoint};
+
 use crate::domain::entities::models::{
     EmailSendStatusType, ErrorDetail, ErrorResponse, SentEmail, SentEmailResponse,
 };
@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 use url::Url;
 use uuid::Uuid;
+use crate::adapters::gateways::acs_shared_key::{get_request_header, parse_endpoint};
 
 type EmailResult<T> = Result<T, ErrorResponse>;
 const API_VERSION: &str = "2023-01-15-preview";
@@ -214,7 +215,7 @@ where
         &json_body,
         acs_auth_method,
     )
-    .await?;
+        .await?;
     let request_builder = client.request(method, url).headers(headers);
     let request_builder = if let Some(body) = body {
         request_builder.json(body)
@@ -404,7 +405,7 @@ async fn acs_get_email_status(
         None,
         acs_auth_method,
     )
-    .await?;
+        .await?;
     if response.status() == StatusCode::OK {
         let email_response = parse_response::<SentEmailResponse>(response).await?;
         email_response
@@ -448,7 +449,7 @@ async fn acs_send_email(
         Some(email),
         acs_auth_method,
     )
-    .await?;
+        .await?;
     debug!("{:#?}", response);
     // handle response and retry if needed
     handle_response_and_retry_if_needed(
@@ -460,7 +461,7 @@ async fn acs_send_email(
         acs_auth_method,
         3,
     )
-    .await
+        .await
 }
 /// Handle the response from the email send operation and retry if needed.
 ///
@@ -593,3 +594,4 @@ fn create_missing_status_error() -> ErrorResponse {
 fn create_missing_id_error() -> ErrorResponse {
     to_error_response("Missing ID in response", "")
 }
+

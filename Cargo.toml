@@ -2,9 +2,17 @@
 name = "azure-ecs-rs"
 version = "0.1.0"
 edition = "2021"
+description = "Azure ECS (Email Communication Service) Rust SDK"
+license = "MIT"
+repository = "https://github.com/preedep/azure-ecs-rs"
+homepage = "https://github.com/preedep/azure-ecs-rs"
+readme = "README.md"
+authors = ["Preedee.P <preedee.digital@gmail.com>"]
+keywords = ["azure", "communications", "email"]
+categories = ["api-bindings", "email"]
+
 
 [dependencies]
-pretty_env_logger = "0.5"
 log = "0.4"
 serde = { version = "1.0" , features = ["derive"]}
 serde_derive = "1.0"
@@ -22,3 +30,8 @@ azure_core = {version = "0.21"}
 azure_identity = {version = "0.21",default-features = false, features = ["development",
     "tz-rs",
     "enable_reqwest_rustls"]}
+
+
+[dev-dependencies]
+dotenv = "0.15"
+pretty_env_logger = "0.5"

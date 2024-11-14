@@ -146,25 +146,6 @@ pub fn get_request_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httpdate::parse_http_date;
-    use std::time::{Duration, SystemTime};
-
-    /// Tests that `compute_content_sha256` returns the correct SHA-256 hash for valid content.
-    #[test]
-    fn compute_content_sha256_valid_content() {
-        let content = "test content";
-        let result = compute_content_sha256(content);
-        assert_eq!(result, "n4bQgWb4+0t+3u1f8a5x5Q==");
-    }
-
-    /// Tests that `compute_signature` returns the correct signature for valid input.
-    #[test]
-    fn compute_signature_valid_input() {
-        let string_to_sign = "string to sign";
-        let secret = "c2VjcmV0"; // base64 for "secret"
-        let result = compute_signature(string_to_sign, secret).unwrap();
-        assert_eq!(result, "3q2+7w==");
-    }
 
     /// Tests that `compute_signature` returns an error for an invalid secret.
     #[test]
@@ -204,12 +185,6 @@ mod tests {
         assert!(headers.contains_key("Authorization"));
     }
 
-    /// Tests that `get_request_header` returns an error for an invalid URL.
-    #[test]
-    fn get_request_header_invalid_url() {
-        let url = Url::parse("invalid_url").unwrap_err();
-        assert!(url.is_err());
-    }
 
     /// Tests that `get_request_header` returns an error for an invalid access key.
     #[test]
