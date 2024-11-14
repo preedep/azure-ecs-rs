@@ -2,5 +2,38 @@
 name = "azure-ecs-rs"
 version = "0.1.0"
 edition = "2021"
+description = "Azure ECS (Email Communication Service) Rust SDK"
+license = "MIT"
+repository = "https://github.com/preedep/azure-ecs-rs"
+homepage = "https://github.com/preedep/azure-ecs-rs"
+readme = "README.md"
+authors = ["Preedee.P <preedee.digital@gmail.com>"]
+keywords = ["azure", "communications", "email"]
+categories = ["api-bindings", "email"]
+
 
 [dependencies]
+log = "0.4"
+serde = { version = "1.0" , features = ["derive"]}
+serde_derive = "1.0"
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json","rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { version = "1.2" , features = ["v4","fast-rng","macro-diagnostics"]}
+httpdate = "1.0"
+base64 = "0.22"
+url = "2.3"
+substring = "1.4.5"
+azure_core = {version = "0.21"}
+azure_identity = {version = "0.21",default-features = false, features = ["development",
+    "tz-rs",
+    "enable_reqwest_rustls"]}
+
+
+[dev-dependencies]
+dotenv = "0.15"
+pretty_env_logger = "0.5"
+clap = {version = "4.5", features = ["derive"]}
+lettre = { version = "0.11" ,default-features = false, features = ["builder","hostname","rustls-tls","pool","smtp-transport"]}
