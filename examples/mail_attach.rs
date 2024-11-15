@@ -1,5 +1,5 @@
 use std::env;
-use log::{error, info};
+use log::{debug, error, info};
 use azure_ecs_rs::adapters::gateways::acs_email::ACSClientBuilder;
 use azure_ecs_rs::domain::entities::models::{EmailAddress, EmailAttachmentBuilder, EmailContent, Recipients, SentEmailBuilder};
 
@@ -56,6 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
         .user_engagement_tracking_disabled(false)
         .build()
         .expect("Failed to build SentEmail");
+
+
+    debug!("Sending email... {:#?}", send_email);
 
     let res = acs_client.send_email(&send_email).await;
     match res {
