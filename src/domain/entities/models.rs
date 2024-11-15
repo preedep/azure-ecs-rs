@@ -362,7 +362,10 @@ impl EmailAttachmentBuilder {
                 let mut buffer = Vec::new();
                 file.read_to_end(&mut buffer).map_err(|e| format!("Failed to read file {:?}",e))?;
                 // Infer the content type of the file
-                let content_type = infer::get(&buffer).ok_or("Failed to infer content type".to_string())?;
+                let content_type = infer::Infer::new().get(&buffer)
+                    .map(|info| info.mime_type().to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+
                 self.attachment_type = Some(content_type.to_string());
                 // Encode the byte vector to a Base64 string
                 let encoded = general_purpose::STANDARD.encode(&buffer);
@@ -583,6 +586,7 @@ mod tests {
             .file_to_base64(file_path)
             .build()
             .unwrap();
+        println!("{:?}", attachment);
         assert_eq!(attachment.name.unwrap(), "test_file.txt");
         std::fs::remove_file(file_path).unwrap();
     }
