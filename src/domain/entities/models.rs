@@ -1,3 +1,5 @@
+use base64::engine::general_purpose;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Formatter;
@@ -5,8 +7,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
-use base64::Engine;
-use base64::engine::general_purpose;
 
 /// Represents the status of an email send operation.
 #[derive(Serialize, Deserialize, Debug)]
@@ -303,7 +303,7 @@ impl EmailAttachmentBuilder {
             name: None,
             attachment_type: None,
             content_bytes_base64: None,
-            file_path : None
+            file_path: None,
         }
     }
 
@@ -318,10 +318,12 @@ impl EmailAttachmentBuilder {
     /// # Returns
     ///
     /// * `Self` - The builder instance.
-    pub fn content_bytes_base64(mut self,
-                                name: String,
-                                content_type:String,
-                                content_bytes_base64: String) -> Self {
+    pub fn content_bytes_base64(
+        mut self,
+        name: String,
+        content_type: String,
+        content_bytes_base64: String,
+    ) -> Self {
         self.name = Some(name);
         self.attachment_type = Some(content_type);
         self.content_bytes_base64 = Some(content_bytes_base64);
@@ -337,7 +339,7 @@ impl EmailAttachmentBuilder {
     /// # Returns
     ///
     /// * `Self` - The builder instance.
-    pub fn file_to_base64(mut self, file_path: &str) -> Self{
+    pub fn file_to_base64(mut self, file_path: &str) -> Self {
         self.file_path = Some(file_path.to_string());
         self
     }
@@ -354,15 +356,20 @@ impl EmailAttachmentBuilder {
                 if !path.exists() {
                     return Err("File does not exist".to_string());
                 }
-                let name = path.file_name().ok_or("File name is required".to_string())?;
+                let name = path
+                    .file_name()
+                    .ok_or("File name is required".to_string())?;
                 self.name = Some(name.to_string_lossy().to_string());
                 // Open the file
-                let mut file = File::open(file_path).map_err(|e| format!("Failed to open file {:?}",e))?;
+                let mut file =
+                    File::open(file_path).map_err(|e| format!("Failed to open file {:?}", e))?;
                 // Read the file contents into a byte vector
                 let mut buffer = Vec::new();
-                file.read_to_end(&mut buffer).map_err(|e| format!("Failed to read file {:?}",e))?;
+                file.read_to_end(&mut buffer)
+                    .map_err(|e| format!("Failed to read file {:?}", e))?;
                 // Infer the content type of the file
-                let content_type = infer::Infer::new().get(&buffer)
+                let content_type = infer::Infer::new()
+                    .get(&buffer)
                     .map(|info| info.mime_type().to_string())
                     .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -370,8 +377,8 @@ impl EmailAttachmentBuilder {
                 // Encode the byte vector to a Base64 string
                 let encoded = general_purpose::STANDARD.encode(&buffer);
                 encoded
-            },
-            None => self.content_bytes_base64.ok_or("Content is required")?
+            }
+            None => self.content_bytes_base64.ok_or("Content is required")?,
         };
         Ok(EmailAttachment {
             name: self.name,

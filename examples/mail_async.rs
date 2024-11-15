@@ -1,6 +1,7 @@
 use azure_ecs_rs::adapters::gateways::acs_email::ACSClientBuilder;
 use azure_ecs_rs::domain::entities::models::{
-    EmailAddress, EmailAttachmentBuilder, EmailContent, Recipients, SentEmailBuilder,
+    EmailAddress, EmailAttachmentBuilder, EmailContent, EmailSendStatusType, Recipients,
+    SentEmailBuilder,
 };
 use log::{debug, error, info};
 use std::env;
@@ -65,11 +66,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     debug!("Sending email... {:#?}", send_email);
 
-    let res = acs_client.send_email(&send_email).await;
+    let res = acs_client
+        .send_email_with_callback(&send_email, |msg_id, status, error| {
+            info!(
+                "Email with id: {} has status: {:?} and error: {:?}",
+                msg_id, status, error
+            );
+        })
+        .await;
+
     match res {
-        Ok(id) => info!("Email sent successfully with id: {}", id),
+        Ok((id,rx)) => {
+            if let _ = rx.await {
+                info!("Email sent successfully with id: {}", id);
+            }
+        },
         Err(e) => error!("Failed to send email: {:?}", e),
     }
-
     Ok(())
 }
