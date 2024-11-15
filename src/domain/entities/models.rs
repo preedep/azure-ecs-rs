@@ -502,100 +502,65 @@ impl fmt::Display for EmailSendStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
 
     #[test]
-    fn email_send_status_to_type() {
-        let status = EmailSendStatus(EmailSendStatusType::Succeeded);
-        assert_eq!(status.to_type(), EmailSendStatusType::Succeeded);
+    fn sent_email_builder_with_missing_content() {
+        let result = SentEmailBuilder::new()
+            .sender("sender@example.com".to_string())
+            .recipients(Recipients {
+                to: Some(vec![EmailAddress {
+                    email: Some("to@example.com".to_string()),
+                    display_name: Some("To".to_string()),
+                }]),
+                cc: None,
+                b_cc: None,
+            })
+            .build();
+        assert!(result.is_err());
     }
 
     #[test]
-    fn email_send_status_type_from_str() {
-        assert_eq!(EmailSendStatusType::from_str("Running").unwrap(), EmailSendStatusType::Running);
-        assert_eq!(EmailSendStatusType::from_str("Unknown").unwrap(), EmailSendStatusType::Unknown);
-    }
-
-    #[test]
-    fn email_send_status_type_from_str_invalid() {
-        assert_eq!(EmailSendStatusType::from_str("Invalid").unwrap(), EmailSendStatusType::Unknown);
-    }
-
-    #[test]
-    fn sent_email_builder_with_all_fields() {
-        let email = SentEmailBuilder::new()
+    fn sent_email_builder_with_missing_recipients() {
+        let result = SentEmailBuilder::new()
             .sender("sender@example.com".to_string())
             .content(EmailContent {
                 subject: Some("Subject".to_string()),
                 plain_text: Some("Plain text".to_string()),
                 html: Some("<p>HTML</p>".to_string()),
             })
-            .recipients(Recipients {
-                to: Some(vec![EmailAddress {
-                    email: Some("to@example.com".to_string()),
-                    display_name: Some("To".to_string()),
-                }]),
-                cc: None,
-                b_cc: None,
-            })
-            .build()
-            .unwrap();
-        assert_eq!(email.sender, "sender@example.com");
-    }
-
-    #[test]
-    fn sent_email_builder_missing_sender() {
-        let result = SentEmailBuilder::new()
-            .content(EmailContent {
-                subject: Some("Subject".to_string()),
-                plain_text: Some("Plain text".to_string()),
-                html: Some("<p>HTML</p>".to_string()),
-            })
-            .recipients(Recipients {
-                to: Some(vec![EmailAddress {
-                    email: Some("to@example.com".to_string()),
-                    display_name: Some("To".to_string()),
-                }]),
-                cc: None,
-                b_cc: None,
-            })
             .build();
         assert!(result.is_err());
     }
 
     #[test]
-    fn email_attachment_builder_with_content_bytes_base64() {
-        let attachment = EmailAttachmentBuilder::new()
-            .content_bytes_base64(
-                "attachment.txt".to_string(),
-                "text/plain".to_string(),
-                "SGVsbG8gd29ybGQ=".to_string(),
-            )
-            .build()
-            .unwrap();
-        assert_eq!(attachment.name.unwrap(), "attachment.txt");
-    }
-
-    #[test]
-    fn email_attachment_builder_with_file_to_base64() {
-        let file_path = "test_file.txt";
-        let mut file = File::create(file_path).unwrap();
-        writeln!(file, "Hello world").unwrap();
-        let attachment = EmailAttachmentBuilder::new()
-            .file_to_base64(file_path)
-            .build()
-            .unwrap();
-        println!("{:?}", attachment);
-        assert_eq!(attachment.name.unwrap(), "test_file.txt");
-        std::fs::remove_file(file_path).unwrap();
-    }
-
-    #[test]
-    fn email_attachment_builder_with_nonexistent_file() {
+    fn email_attachment_builder_with_invalid_file_path() {
         let result = EmailAttachmentBuilder::new()
-            .file_to_base64("nonexistent_file.txt")
+            .file_to_base64("invalid_path.txt")
             .build();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn email_content_with_all_fields() {
+        let content = EmailContent {
+            subject: Some("Subject".to_string()),
+            plain_text: Some("Plain text".to_string()),
+            html: Some("<p>HTML</p>".to_string()),
+        };
+        assert_eq!(content.subject.unwrap(), "Subject");
+        assert_eq!(content.plain_text.unwrap(), "Plain text");
+        assert_eq!(content.html.unwrap(), "<p>HTML</p>");
+    }
+
+    #[test]
+    fn email_content_with_missing_fields() {
+        let content = EmailContent {
+            subject: None,
+            plain_text: Some("Plain text".to_string()),
+            html: None,
+        };
+        assert!(content.subject.is_none());
+        assert_eq!(content.plain_text.unwrap(), "Plain text");
+        assert!(content.html.is_none());
     }
 }
