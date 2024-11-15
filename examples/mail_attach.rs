@@ -38,11 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("Failed to build ACS client");
 
+    // Create an EmailAttachment by using the builder pattern
+    // The file_to_base64 method reads the file and converts it to base64
     let mail_attach = EmailAttachmentBuilder::new()
         .file_to_base64("test_file.txt")
         .build()
         .expect("Failed to build EmailAttachment");
 
+    // Create a SentEmail by using the builder pattern
+    // The attachments method takes a vector of EmailAttachment
     let send_email = SentEmailBuilder::new()
         .sender(sender.to_owned())
         .content(EmailContent {

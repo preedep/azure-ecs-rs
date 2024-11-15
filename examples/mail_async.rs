@@ -66,6 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     debug!("Sending email... {:#?}", send_email);
 
+    // Send the email with a callback
+    // The callback will be called when the rest api sends the email
     let res = acs_client
         .send_email_with_callback(&send_email, |msg_id, status, error| {
             info!(
