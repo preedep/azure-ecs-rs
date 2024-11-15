@@ -28,3 +28,4 @@ Cargo.lock
 /.idea/azure-ecs-rs.iml
 /.idea/modules.xml
 /.idea/vcs.xml
+/test_file.txt

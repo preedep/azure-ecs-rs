@@ -20,7 +20,7 @@ use url::Url;
 use uuid::Uuid;
 
 type EmailResult<T> = Result<T, ErrorResponse>;
-const API_VERSION: &str = "2023-01-15-preview";
+const API_VERSION: &str = "2023-03-31";
 
 // Azure Communication Services (ACS) authentication method
 #[derive(Clone)]
