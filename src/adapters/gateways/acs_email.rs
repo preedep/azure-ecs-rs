@@ -20,7 +20,7 @@ use url::Url;
 use uuid::Uuid;
 
 type EmailResult<T> = Result<T, ErrorResponse>;
-const API_VERSION: &str = "2023-01-15-preview";
+const API_VERSION: &str = "2023-03-31";
 
 // Azure Communication Services (ACS) authentication method
 #[derive(Clone)]
@@ -264,17 +264,9 @@ async fn get_access_token(auth_method: &ACSAuthMethod) -> Result<String, String>
         } => {
             // Use Azure AD client credential flow (requires async-http-client support)
             let http_client = create_http_client();
-            /*
-            let token_url = format!(
-                "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-                tenant_id
-            );*/
+
             let token_url = "https://login.microsoftonline.com/";
-            debug!("Token URL: {}", token_url);
-            debug!("Creating client secret credential");
-            debug!("Client ID: {}", client_id);
-            debug!("Client Secret: {}", client_secret);
-            debug!("Tenant ID: {}", tenant_id);
+
             let credential = ClientSecretCredential::new(
                 http_client,
                 Url::parse(&token_url).unwrap(),
@@ -286,7 +278,7 @@ async fn get_access_token(auth_method: &ACSAuthMethod) -> Result<String, String>
                 .get_token(&["https://communication.azure.com/.default"])
                 .await
                 .map_err(|e| format!("Failed to get access token: {}", e))?;
-            debug!("Access token: {:#?}", token);
+
 
             return Ok(token.token.secret().to_owned());
         }
@@ -350,7 +342,7 @@ async fn create_headers(
         }
     }
 
-    debug!("Headers: {:#?}", headers);
+
     Ok(headers)
 }
 

@@ -1,6 +1,11 @@
+use base64::engine::general_purpose;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Formatter;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::str::FromStr;
 
 /// Represents the status of an email send operation.
@@ -56,8 +61,6 @@ pub struct ErrorDetail {
     #[serde(rename = "code")]
     pub code: Option<String>,
 
-    // #[serde(rename = "details")]
-    // pub(crate) details: Option<ErrorDetail>,
     /// The error message.
     #[serde(rename = "message")]
     pub message: Option<String>,
@@ -281,6 +284,110 @@ pub struct EmailAttachment {
     content_bytes_base64: Option<String>,
 }
 
+/// Builder for creating a `EmailAttachment` instance.
+pub struct EmailAttachmentBuilder {
+    name: Option<String>,
+    attachment_type: Option<String>,
+    content_bytes_base64: Option<String>,
+    file_path: Option<String>,
+}
+
+impl EmailAttachmentBuilder {
+    /// Creates a new `EmailAttachmentBuilder` instance.
+    ///
+    /// # Returns
+    ///
+    /// * `EmailAttachmentBuilder` - A new instance of the builder.
+    pub fn new() -> Self {
+        EmailAttachmentBuilder {
+            name: None,
+            attachment_type: None,
+            content_bytes_base64: None,
+            file_path: None,
+        }
+    }
+
+    /// Sets the content bytes in base64 format for the attachment.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the attachment.
+    /// * `content_type` - The content type of the attachment.
+    /// * `content_bytes_base64` - The base64 encoded content of the attachment.
+    ///
+    /// # Returns
+    ///
+    /// * `Self` - The builder instance.
+    pub fn content_bytes_base64(
+        mut self,
+        name: String,
+        content_type: String,
+        content_bytes_base64: String,
+    ) -> Self {
+        self.name = Some(name);
+        self.attachment_type = Some(content_type);
+        self.content_bytes_base64 = Some(content_bytes_base64);
+        self
+    }
+
+    /// Sets the file path to be converted to base64 format for the attachment.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_path` - The file path of the attachment.
+    ///
+    /// # Returns
+    ///
+    /// * `Self` - The builder instance.
+    pub fn file_to_base64(mut self, file_path: &str) -> Self {
+        self.file_path = Some(file_path.to_string());
+        self
+    }
+
+    /// Builds the `EmailAttachment` instance.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<EmailAttachment, &\`static str\>` - The built `EmailAttachment` instance or an error message.
+    pub fn build(mut self) -> Result<EmailAttachment, String> {
+        let content_bytes_base64 = match self.file_path {
+            Some(file_path) => {
+                let path = Path::new(&file_path);
+                if !path.exists() {
+                    return Err("File does not exist".to_string());
+                }
+                let name = path
+                    .file_name()
+                    .ok_or("File name is required".to_string())?;
+                self.name = Some(name.to_string_lossy().to_string());
+                // Open the file
+                let mut file =
+                    File::open(file_path).map_err(|e| format!("Failed to open file {:?}", e))?;
+                // Read the file contents into a byte vector
+                let mut buffer = Vec::new();
+                file.read_to_end(&mut buffer)
+                    .map_err(|e| format!("Failed to read file {:?}", e))?;
+                // Infer the content type of the file
+                let content_type = infer::Infer::new()
+                    .get(&buffer)
+                    .map(|info| info.mime_type().to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+
+                self.attachment_type = Some(content_type.to_string());
+                // Encode the byte vector to a Base64 string
+                let encoded = general_purpose::STANDARD.encode(&buffer);
+                encoded
+            }
+            None => self.content_bytes_base64.ok_or("Content is required")?,
+        };
+        Ok(EmailAttachment {
+            name: self.name,
+            attachment_type: self.attachment_type,
+            content_bytes_base64: Some(content_bytes_base64),
+        })
+    }
+}
+
 /// Represents the content of an email.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct EmailContent {
@@ -371,6 +478,15 @@ impl fmt::Display for EmailSendStatusType {
 impl FromStr for EmailSendStatusType {
     type Err = ();
 
+    /// Converts a string to an `EmailSendStatusType`.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - A string slice representing the status.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<EmailSendStatusType, ()>` - The corresponding `EmailSendStatusType` or an error.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "Canceled" => Ok(EmailSendStatusType::Canceled),
@@ -387,5 +503,71 @@ impl fmt::Display for EmailSendStatus {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0).expect("EmailSendStatus: panic message");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sent_email_builder_with_missing_content() {
+        let result = SentEmailBuilder::new()
+            .sender("sender@example.com".to_string())
+            .recipients(Recipients {
+                to: Some(vec![EmailAddress {
+                    email: Some("to@example.com".to_string()),
+                    display_name: Some("To".to_string()),
+                }]),
+                cc: None,
+                b_cc: None,
+            })
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sent_email_builder_with_missing_recipients() {
+        let result = SentEmailBuilder::new()
+            .sender("sender@example.com".to_string())
+            .content(EmailContent {
+                subject: Some("Subject".to_string()),
+                plain_text: Some("Plain text".to_string()),
+                html: Some("<p>HTML</p>".to_string()),
+            })
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn email_attachment_builder_with_invalid_file_path() {
+        let result = EmailAttachmentBuilder::new()
+            .file_to_base64("invalid_path.txt")
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn email_content_with_all_fields() {
+        let content = EmailContent {
+            subject: Some("Subject".to_string()),
+            plain_text: Some("Plain text".to_string()),
+            html: Some("<p>HTML</p>".to_string()),
+        };
+        assert_eq!(content.subject.unwrap(), "Subject");
+        assert_eq!(content.plain_text.unwrap(), "Plain text");
+        assert_eq!(content.html.unwrap(), "<p>HTML</p>");
+    }
+
+    #[test]
+    fn email_content_with_missing_fields() {
+        let content = EmailContent {
+            subject: None,
+            plain_text: Some("Plain text".to_string()),
+            html: None,
+        };
+        assert!(content.subject.is_none());
+        assert_eq!(content.plain_text.unwrap(), "Plain text");
+        assert!(content.html.is_none());
     }
 }

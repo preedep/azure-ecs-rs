@@ -1,6 +1,6 @@
 [package]
 name = "azure-ecs-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Azure ECS (Email Communication Service) Rust SDK"
 license = "MIT"
@@ -30,7 +30,7 @@ azure_core = {version = "0.21"}
 azure_identity = {version = "0.21",default-features = false, features = ["development",
     "tz-rs",
     "enable_reqwest_rustls"]}
-
+infer = "0.16"
 
 [dev-dependencies]
 dotenv = "0.15"

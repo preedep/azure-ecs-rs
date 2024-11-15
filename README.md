@@ -8,7 +8,7 @@ This crate provides a Rust client library for the Azure Email Communication Serv
 
 
 Core Features
-- Send Email
+- Send Email (sync and async)
 - Get Email Status
 
 Support Authentication:
@@ -44,7 +44,14 @@ ASC_URL="https://xxxxx.asiapacific.communication.azure.com"
 ```
 My example code is in the `examples` directory. You can run the examples with:
 ```sh
+# For simple email
 RUST_LOG=debug cargo run --example mail
+
+# For simple email with async
+RUST_LOG=debug cargo run --example mail_async
+
+# For email with attachment
+RUST_LOG=debug cargo run --example mail_attach
 ```
 How to use the library:
 - Shared Key
