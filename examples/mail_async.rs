@@ -1,6 +1,6 @@
 use azure_ecs_rs::adapters::gateways::acs_email::ACSClientBuilder;
 use azure_ecs_rs::domain::entities::models::{
-    EmailAddress, EmailAttachmentBuilder, EmailContent, EmailSendStatusType, Recipients,
+    EmailAddress, EmailAttachmentBuilder, EmailContent, Recipients,
     SentEmailBuilder,
 };
 use log::{debug, error, info};
