@@ -409,11 +409,11 @@ pub struct EmailContent {
 pub struct Header {
     /// The name of the header.
     #[serde(rename = "name")]
-    name: Option<String>,
+    pub name: Option<String>,
 
     /// The value of the header.
     #[serde(rename = "value")]
-    value: Option<String>,
+    pub value: Option<String>,
 }
 
 /// Represents the recipients of an email.
