@@ -87,7 +87,7 @@ pub struct ErrorAdditionalInfo {
 pub struct SentEmail {
     /// The headers of the email.
     #[serde(rename = "headers", skip_serializing_if = "Option::is_none")]
-    pub headers: Option<Vec<Header>>,
+    pub headers: Option<HeaderSet>,
 
     /// The sender address of the email.
     #[serde(rename = "senderAddress")]
@@ -119,7 +119,7 @@ pub struct SentEmail {
 
 /// Builder for creating a `SentEmail` instance.
 pub struct SentEmailBuilder {
-    headers: Option<Vec<Header>>,
+    headers: Option<HeaderSet>,
     sender: Option<String>,
     content: Option<EmailContent>,
     recipients: Option<Recipients>,
@@ -157,7 +157,7 @@ impl SentEmailBuilder {
     /// * `Self` - The builder instance.
     #[allow(dead_code)]
     pub fn headers(mut self, headers: Vec<Header>) -> Self {
-        self.headers = Some(headers);
+        self.headers = Some(HeaderSet(headers));
         self
     }
 
@@ -404,8 +404,12 @@ pub struct EmailContent {
     pub html: Option<String>,
 }
 
+/// Represents a set of headers in an email.
+#[derive(Debug)]
+pub struct HeaderSet(Vec<Header>);
+
 /// Represents a header in an email.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Header {
     /// The name of the header.
     #[serde(rename = "name")]
@@ -506,8 +510,43 @@ impl fmt::Display for EmailSendStatus {
     }
 }
 
+impl Serialize for HeaderSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut headers_map = std::collections::BTreeMap::new();
+        for header in self.0.iter().filter(|header| header.name.is_some() && header.value.is_some()) {
+            headers_map.insert(header.name.as_ref().unwrap(), header.value.as_ref().unwrap());
+        }
+        headers_map.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HeaderSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let headers_map: std::collections::BTreeMap<String, String> =
+            serde::Deserialize::deserialize(deserializer)?;
+
+        let headers = headers_map
+            .into_iter()
+            .map(|(name, value)| Header {
+                name: Some(name),
+                value: Some(value),
+            })
+            .collect();
+
+        Ok(HeaderSet(headers))
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use super::*;
 
     #[test]
@@ -569,5 +608,61 @@ mod tests {
         assert!(content.subject.is_none());
         assert_eq!(content.plain_text.unwrap(), "Plain text");
         assert!(content.html.is_none());
+    }
+
+    #[test]
+    fn test_header_set_serialization() {
+        let header_set = HeaderSet(vec![
+            Header {
+                name: Some("Content-Type".to_string()),
+                value: Some("application/json".to_string()),
+            },
+            Header {
+                name: Some("Authorization".to_string()),
+                value: Some("Bearer token".to_string()),
+            },
+        ]);
+        let serialized = serde_json::to_value(&header_set).expect("Failed to serialize HeaderSet");
+        let expected = json!({
+            "Content-Type": "application/json",
+            "Authorization": "Bearer token"
+        });
+        assert_eq!(serialized, expected);
+
+        let serialized = serde_json::to_string(&header_set).expect("Failed to serialize HeaderSet");
+        let deserialized: HeaderSet =
+            serde_json::from_str(&serialized).expect("Failed to deserialize HeaderSet");
+        assert_eq!(deserialized.0.len(), 2);
+        assert_eq!(
+            deserialized.0[0],
+            Header {
+                name: Some("Authorization".to_string()),
+                value: Some("Bearer token".to_string())
+            }
+        );
+        assert_eq!(
+            deserialized.0[1],
+            Header {
+                name: Some("Content-Type".to_string()),
+                value: Some("application/json".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn test_empty_header_set_serialization() {
+        let header_set = HeaderSet(Vec::new());
+        let serialized = serde_json::to_value(&header_set).expect("Failed to serialize HeaderSet");
+        let expected = json!({});
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn test_header_set_empty_deserialization() {
+        let header_set = HeaderSet(Vec::new());
+        let serialized = serde_json::to_string(&header_set).expect("Failed to serialize HeaderSet");
+        let deserialized: HeaderSet =
+            serde_json::from_str(&serialized).expect("Failed to deserialize HeaderSet");
+        assert!(deserialized.0.is_empty());
     }
 }
