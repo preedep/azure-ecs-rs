@@ -1,0 +1,31 @@
+name: Azure E2E
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: Azure E2E tests
+    runs-on: ubuntu-latest
+    # Skip if the required secret is not configured (forks, PRs from forks).
+    if: ${{ secrets.CONNECTION_STR != '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Azure E2E tests (Shared Key + Service Principal)
+        env:
+          CONNECTION_STR: ${{ secrets.CONNECTION_STR }}
+          SENDER:         ${{ secrets.SENDER }}
+          TO_EMAIL:       ${{ secrets.TO_EMAIL }}
+          TENANT_ID:      ${{ secrets.TENANT_ID }}
+          CLIENT_ID:      ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET:  ${{ secrets.CLIENT_SECRET }}
+          ASC_URL:        ${{ secrets.ASC_URL }}
+        run: cargo test --test azure_e2e -- --include-ignored --nocapture

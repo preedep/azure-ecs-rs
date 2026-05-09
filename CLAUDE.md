@@ -65,6 +65,32 @@ Live in `mod integration_tests` inside `acs_email.rs`. Use `wiremock` to start a
 
 **How it works:** `ACSClientBuilder` has a `#[cfg(test)] pub(crate) fn base_url_override(url: &str)` method that replaces the computed `https://<host>` with the wiremock server URI. Auth headers are computed with a dummy shared key; the mock server ignores them.
 
+### Azure E2E tests
+
+Live in `tests/azure_e2e.rs`. Every test is marked `#[ignore]` — skipped by `cargo test`, run explicitly:
+
+```bash
+CONNECTION_STR="…" SENDER="…" TO_EMAIL="…" \
+cargo test --test azure_e2e -- --include-ignored --nocapture
+```
+
+A separate CI workflow (`.github/workflows/azure_e2e.yml`) runs these on `develop` / `main` using GitHub Actions secrets. See **ADR-003** for design rationale.
+
+| Test | Auth | What only real Azure can prove |
+|---|---|---|
+| `shared_key_send_email_accepted` | SharedKey | HMAC-SHA256 signature accepted by Azure |
+| `shared_key_get_email_status_after_send` | SharedKey | Operation ID is a real pollable UUID |
+| `shared_key_send_email_v20250901` | SharedKey | API version `2025-09-01` accepted |
+| `shared_key_send_email_stream_yields_at_least_one_status` | SharedKey | Stream polling against live server |
+| `shared_key_send_email_stream_cancellable_stops_cleanly` | SharedKey | Cancellation does not hang against live server |
+| `shared_key_send_emails_batch_all_accepted` | SharedKey | Concurrent batch dispatch accepted |
+| `service_principal_send_email_accepted` | ServicePrincipal | OAuth2 token acquisition + bearer auth |
+| `service_principal_get_email_status_after_send` | ServicePrincipal | Status polling with bearer auth |
+| `managed_identity_send_email_accepted` | ManagedIdentity | Ambient credential (cloud-only) |
+| `cloned_client_sends_independently` | SharedKey | Both `ACSClient` clones reach Azure |
+
+**Required env vars:** `CONNECTION_STR`, `SENDER`, `TO_EMAIL` for SharedKey tests; additionally `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `ASC_URL` for ServicePrincipal; `ASC_URL` for ManagedIdentity. Use a dedicated test mailbox for `TO_EMAIL`.
+
 ## Architecture
 
 The codebase follows a hexagonal (ports-and-adapters) layout:
