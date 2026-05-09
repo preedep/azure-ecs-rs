@@ -12,7 +12,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                                          # build
-cargo test                                           # run all 93 tests (unit + integration)
+cargo test                                           # run all 100 tests (unit + integration)
+cargo clippy -- -D warnings                          # lint (must pass clean for CI)
+cargo fmt --check                                    # format check (must pass clean for CI)
 cargo test <name>                                    # run a single test by name substring
 cargo clippy                                         # lint
 cargo run --example mail                             # sync example (shared key auth)
@@ -181,3 +183,14 @@ Significant design decisions are captured in `docs/adr/`:
 |---|---|
 | [ADR-001](docs/adr/ADR-001-phase5-opt-out-arm-only.md) | Opt-out / suppression list management is ARM management-plane only — not implemented in this data-plane SDK |
 | [ADR-002](docs/adr/ADR-002-integration-tests-wiremock.md) | Integration tests use `wiremock` with a `#[cfg(test)]` `base_url_override` builder method; no Azure credentials required |
+
+## GitHub Actions
+
+| Workflow | File | Trigger |
+|---|---|---|
+| CI | `.github/workflows/ci.yml` | Push / PR to `main` or `develop` |
+| Release | `.github/workflows/release.yml` | Push of tag matching `v*.*.*` |
+
+**CI** runs two jobs in parallel: `test` (`cargo build` + `cargo test`) and `lint` (`cargo clippy -- -D warnings` + `cargo fmt --check`).
+
+**Release** requires the git tag to match the version in `Cargo.toml`, then runs full CI, publishes to crates.io (`CARGO_REGISTRY_TOKEN` secret required), and creates a GitHub Release with auto-generated notes.

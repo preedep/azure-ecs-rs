@@ -895,6 +895,40 @@ mod tests {
         assert_eq!(status.to_type(), EmailSendStatusType::Running);
     }
 
+    // ── Header public fields (sunsided PR #5) ────────────────────────────────
+
+    #[test]
+    fn header_fields_are_public_and_readable() {
+        let h = Header {
+            name: Some("X-Custom".to_string()),
+            value: Some("hello".to_string()),
+        };
+        assert_eq!(h.name.as_deref(), Some("X-Custom"));
+        assert_eq!(h.value.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn sent_email_builder_headers_appear_in_serialized_json() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: Some("Hi".to_string()),
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients { to: None, cc: None, b_cc: None })
+            .headers(vec![
+                Header { name: Some("X-Foo".to_string()), value: Some("bar".to_string()) },
+                Header { name: Some("X-Baz".to_string()), value: Some("qux".to_string()) },
+            ])
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&email).unwrap();
+        let headers = json.get("headers").expect("headers should be present");
+        assert_eq!(headers["X-Foo"], "bar");
+        assert_eq!(headers["X-Baz"], "qux");
+    }
+
     // ── HeaderSet serialization edge cases ───────────────────────────────────
 
     #[test]

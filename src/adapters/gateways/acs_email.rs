@@ -872,6 +872,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_err_produces_deserialization_variant() {
+        assert!(matches!(parse_err("bad json"), ACSError::Deserialization(_)));
+    }
+
+    #[test]
     fn url_err_produces_invalid_url_variant() {
         assert!(matches!(url_err("bad"), ACSError::InvalidUrl(_)));
     }
@@ -1274,5 +1279,127 @@ mod integration_tests {
         let client = client_for(&server);
         let result = client.get_email_status("no-such").await;
         assert!(matches!(result, Err(ACSError::Api { .. })));
+    }
+
+    // ── send_email_with_callback ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_with_callback_invokes_callback_on_succeeded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "cb-msg" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/cb-msg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "id": "cb-msg", "status": "Succeeded" })),
+            )
+            .mount(&server)
+            .await;
+
+        let collected: std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+
+        let client = client_for(&server);
+        let email = minimal_email();
+        let (message_id, done_rx) = client
+            .send_email_with_callback(&email, move |id, status, err| {
+                collected_clone
+                    .lock()
+                    .unwrap()
+                    .push((format!("{id}:{status}"), err.is_some()));
+            })
+            .await
+            .unwrap();
+
+        let _ = done_rx.await;
+
+        assert_eq!(message_id, "cb-msg");
+        let calls = collected.lock().unwrap();
+        assert!(!calls.is_empty(), "callback should have been called at least once");
+        assert!(calls.iter().any(|(s, _)| s.contains("Succeeded")), "callback should report Succeeded");
+        assert!(calls.iter().all(|(_, has_err)| !has_err), "no error expected in callbacks");
+    }
+
+    #[tokio::test]
+    async fn send_email_with_callback_returns_error_when_send_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": { "code": "InternalError", "message": "server fault" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let email = minimal_email();
+        let result = client
+            .send_email_with_callback(&email, |_, _, _| {})
+            .await;
+
+        assert!(matches!(result, Err(ACSError::Api { .. })));
+    }
+
+    // ── parse_response: bad JSON → Deserialization error ──────────────────────
+
+    #[tokio::test]
+    async fn send_email_malformed_json_response_returns_deserialization_error() {
+        let server = MockServer::start().await;
+        // 202 but body is not valid JSON for SentEmailResponse
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_string("not json at all"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let result = client.send_email(&minimal_email()).await;
+        assert!(matches!(result, Err(ACSError::Deserialization(_))));
+    }
+
+    // ── handle_response_and_retry_if_needed: Retry-After header ──────────────
+
+    #[tokio::test]
+    async fn send_email_respects_retry_after_header() {
+        let server = MockServer::start().await;
+        // First request → 429 with Retry-After: 1
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .append_header("Retry-After", "1")
+                    .set_body_json(json!({
+                        "error": { "code": "TooManyRequests", "message": "slow down" }
+                    })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Second request → 202
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "after-retry" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .max_retries(3)
+            .base_url_override(&server.uri())
+            .build()
+            .unwrap();
+
+        let result = client.send_email(&minimal_email()).await;
+        assert_eq!(result.unwrap(), "after-retry");
     }
 }

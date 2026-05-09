@@ -55,11 +55,12 @@
 
 ---
 
-## Phase 6 — CI/CD (runs in parallel with other phases)
+## Phase 6 — CI/CD (runs in parallel with other phases) ✅ complete
 
 | # | Feature | Status |
 |---|---|---|
-| 9 | GitHub Actions workflow — `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` on every PR | ⬜ |
+| 9 | CI workflow — `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` on push/PR to `main` and `develop` | ✅ |
+| 10 | Release workflow — triggered on `v*.*.*` tags: verifies tag matches `Cargo.toml` version, runs full CI, publishes to crates.io, creates GitHub Release with auto-generated notes | ✅ |
 
 ---
 

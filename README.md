@@ -225,6 +225,7 @@ Then run with `RUST_LOG=debug` to see library spans alongside application logs.
 | `cargo run --example mail_error_handling` | Typed `ACSError` matching + status poll loop |
 | `cargo run --example mail_retry_timeout` | Retry/timeout configuration |
 | `cargo run --example mail_attach_async` | Non-blocking attachment + full tracing setup |
+| `cargo run --example mail_stream` | Stream-based status polling with `send_email_stream` |
 
 Prefix any example with `RUST_LOG=debug` to enable tracing output.
 
