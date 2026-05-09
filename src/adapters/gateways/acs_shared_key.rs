@@ -23,7 +23,7 @@ pub fn compute_content_sha256(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     let result = hasher.finalize();
-    general_purpose::STANDARD.encode(&result)
+    general_purpose::STANDARD.encode(result)
 }
 
 /// Computes the HMAC-SHA256 signature for the given string using the provided secret.

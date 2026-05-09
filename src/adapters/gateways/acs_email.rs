@@ -369,17 +369,17 @@ where
     request_builder
         .send()
         .await
-        .map_err(|e| network_err(e))
+        .map_err(network_err)
 }
 
 fn parse_url(url: &str) -> EmailResult<Url> {
-    Url::parse(url).map_err(|e| url_err(e))
+    Url::parse(url).map_err(url_err)
 }
 
 fn serialize_body<T: serde::Serialize>(body: Option<&T>) -> EmailResult<String> {
     if let Some(body) = body {
         serde_json::to_string(body)
-            .map_err(|e| serial_err(e))
+            .map_err(serial_err)
     } else {
         Ok(String::new())
     }
@@ -410,7 +410,7 @@ async fn get_access_token(http_client: &Client, auth_method: &ACSAuthMethod) -> 
 
             let credential = ClientSecretCredential::new(
                 azure_http_client,
-                Url::parse(&token_url).unwrap(),
+                Url::parse(token_url).unwrap(),
                 tenant_id.to_string(),
                 client_id.to_string(),
                 client_secret.to_string(),
@@ -463,12 +463,12 @@ async fn create_headers(
     match auth_method {
         ACSAuthMethod::SharedKey(share_key) => {
             headers = get_request_header(url_endpoint, method, request_id, json_body, share_key)
-                .map_err(|e| header_err(e))?
+                .map_err(header_err)?
         }
         ACSAuthMethod::ServicePrincipal { .. } | ACSAuthMethod::ManagedIdentity => {
             let token = get_access_token(http_client, auth_method)
                 .await
-                .map_err(|e| auth_err(e))?;
+                .map_err(auth_err)?;
             headers.insert(
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {}", token).parse().unwrap(),
@@ -635,6 +635,7 @@ async fn acs_send_email(
 /// # Returns
 ///
 /// * `EmailResult<String>` - The result of the response handling, containing the message ID if successful.
+#[allow(clippy::too_many_arguments)]
 async fn handle_response_and_retry_if_needed<T>(
     http_client: &Client,
     mut response: reqwest::Response,
@@ -717,7 +718,7 @@ where
     response
         .json::<T>()
         .await
-        .map_err(|e| parse_err(e))
+        .map_err(parse_err)
 }
 
 /// Parse the error response from the email send operation.

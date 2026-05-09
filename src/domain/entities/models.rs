@@ -441,8 +441,7 @@ impl EmailAttachmentBuilder {
 
                 self.attachment_type = Some(content_type.to_string());
                 // Encode the byte vector to a Base64 string
-                let encoded = general_purpose::STANDARD.encode(&buffer);
-                encoded
+                general_purpose::STANDARD.encode(&buffer)
             }
             None => self.content_bytes_base64.ok_or("Content is required")?,
         };
