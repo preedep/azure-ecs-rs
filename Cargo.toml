@@ -36,6 +36,7 @@ infer = "0.16"
 thiserror = "2"
 async-stream = "0.3"
 futures = "0.3"
+tokio-util = { version = "0.7" }
 
 [dev-dependencies]
 dotenv = "0.15"
