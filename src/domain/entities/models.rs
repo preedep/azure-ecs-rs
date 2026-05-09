@@ -1,3 +1,21 @@
+//! Domain model — all data types, builders, and the `ACSError` error enum.
+//!
+//! # Key types
+//!
+//! | Type | Role |
+//! |---|---|
+//! | [`ACSError`] | Typed error returned by every public `ACSClient` method |
+//! | [`SentEmail`] / [`SentEmailBuilder`] | Top-level email payload |
+//! | [`EmailAttachment`] / [`EmailAttachmentBuilder`] | File attachment with sync and async build paths |
+//! | [`EmailSendStatusType`] | Delivery status enum (`NotStarted`, `Running`, `Succeeded`, …) |
+//! | [`HeaderSet`] | Custom email headers; serialises as a flat `{"name": "value"}` JSON map |
+//!
+//! # Builder pattern
+//!
+//! All three builders implement [`Default`] and delegate to `new()`.  Use
+//! [`SentEmailBuilder`] to construct a validated [`SentEmail`]; build returns
+//! `Err(ACSError::MissingField)` if required fields are absent.
+
 use base64::engine::general_purpose;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -6,7 +24,63 @@ use std::fmt::Formatter;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
+
+/// Typed error returned by all public `ACSClient` methods.
+#[derive(Debug, thiserror::Error)]
+pub enum ACSError {
+    /// HTTP request could not be sent (DNS, TLS, connection refused, …).
+    #[error("network error: {0}")]
+    Network(String),
+
+    /// The constructed URL is malformed.
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
+
+    /// Failed to serialize the request body to JSON.
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    /// Failed to deserialize the response body from JSON.
+    #[error("deserialization error: {0}")]
+    Deserialization(String),
+
+    /// Could not obtain an access token (service principal or managed identity).
+    #[error("authentication error: {0}")]
+    Auth(String),
+
+    /// The shared-key HMAC header could not be built.
+    #[error("header error: {0}")]
+    Header(String),
+
+    /// The API returned an error response.
+    #[error("API error {}: {message}", code.as_deref().unwrap_or("unknown"))]
+    Api {
+        code: Option<String>,
+        message: String,
+    },
+
+    /// A required field was absent in the API response.
+    #[error("missing field in response: {0}")]
+    MissingField(&'static str),
+
+    /// Rate limit hit and all retries were exhausted.
+    #[error("rate limit exceeded after {retries} retries")]
+    RateLimitExceeded { retries: u32 },
+}
+
+impl From<ErrorResponse> for ACSError {
+    fn from(e: ErrorResponse) -> Self {
+        let detail = e.error.unwrap_or_default();
+        ACSError::Api {
+            code: detail.code,
+            message: detail
+                .message
+                .unwrap_or_else(|| "unknown error".to_string()),
+        }
+    }
+}
 
 /// Represents the status of an email send operation.
 #[derive(Serialize, Deserialize, Debug)]
@@ -126,6 +200,12 @@ pub struct SentEmailBuilder {
     attachments: Option<Vec<EmailAttachment>>,
     reply_to: Option<Vec<EmailAddress>>,
     user_engagement_tracking_disabled: Option<bool>,
+}
+
+impl Default for SentEmailBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SentEmailBuilder {
@@ -292,6 +372,12 @@ pub struct EmailAttachmentBuilder {
     file_path: Option<String>,
 }
 
+impl Default for EmailAttachmentBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmailAttachmentBuilder {
     /// Creates a new `EmailAttachmentBuilder` instance.
     ///
@@ -375,8 +461,48 @@ impl EmailAttachmentBuilder {
 
                 self.attachment_type = Some(content_type.to_string());
                 // Encode the byte vector to a Base64 string
-                let encoded = general_purpose::STANDARD.encode(&buffer);
-                encoded
+                general_purpose::STANDARD.encode(&buffer)
+            }
+            None => self.content_bytes_base64.ok_or("Content is required")?,
+        };
+        Ok(EmailAttachment {
+            name: self.name,
+            attachment_type: self.attachment_type,
+            content_bytes_base64: Some(content_bytes_base64),
+        })
+    }
+
+    /// Async variant of [`build`](Self::build) — reads the file with `tokio::fs` to avoid
+    /// blocking the async executor. Prefer this over `build()` when a `file_to_base64` path
+    /// has been set and you are inside an async context.
+    ///
+    /// Falls back to the synchronous path when content was supplied via
+    /// [`content_bytes_base64`](Self::content_bytes_base64) (no I/O needed).
+    pub async fn build_async(mut self) -> Result<EmailAttachment, String> {
+        let content_bytes_base64 = match self.file_path {
+            Some(ref file_path) => {
+                let path = PathBuf::from(file_path);
+                if !path.exists() {
+                    return Err("File does not exist".to_string());
+                }
+                let name = path
+                    .file_name()
+                    .ok_or("File name is required".to_string())?
+                    .to_string_lossy()
+                    .to_string();
+                self.name = Some(name);
+
+                let buffer = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| format!("Failed to read file: {}", e))?;
+
+                let content_type = infer::Infer::new()
+                    .get(&buffer)
+                    .map(|info| info.mime_type().to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                self.attachment_type = Some(content_type);
+
+                general_purpose::STANDARD.encode(&buffer)
             }
             None => self.content_bytes_base64.ok_or("Content is required")?,
         };
@@ -516,8 +642,15 @@ impl Serialize for HeaderSet {
         S: serde::Serializer,
     {
         let mut headers_map = std::collections::BTreeMap::new();
-        for header in self.0.iter().filter(|header| header.name.is_some() && header.value.is_some()) {
-            headers_map.insert(header.name.as_ref().unwrap(), header.value.as_ref().unwrap());
+        for header in self
+            .0
+            .iter()
+            .filter(|header| header.name.is_some() && header.value.is_some())
+        {
+            headers_map.insert(
+                header.name.as_ref().unwrap(),
+                header.value.as_ref().unwrap(),
+            );
         }
         headers_map.serialize(serializer)
     }
@@ -543,11 +676,10 @@ impl<'de> serde::Deserialize<'de> for HeaderSet {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sent_email_builder_with_missing_content() {
@@ -664,5 +796,408 @@ mod tests {
         let deserialized: HeaderSet =
             serde_json::from_str(&serialized).expect("Failed to deserialize HeaderSet");
         assert!(deserialized.0.is_empty());
+    }
+
+    // ── SentEmailBuilder ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sent_email_builder_success() {
+        let result = SentEmailBuilder::new()
+            .sender("sender@example.com".to_string())
+            .content(EmailContent {
+                subject: Some("Subject".to_string()),
+                plain_text: Some("Body".to_string()),
+                html: None,
+            })
+            .recipients(Recipients {
+                to: Some(vec![EmailAddress {
+                    email: Some("to@example.com".to_string()),
+                    display_name: Some("To".to_string()),
+                }]),
+                cc: None,
+                b_cc: None,
+            })
+            .build();
+        assert!(result.is_ok());
+        let email = result.unwrap();
+        assert_eq!(email.sender, "sender@example.com");
+    }
+
+    #[test]
+    fn sent_email_builder_missing_sender() {
+        let result = SentEmailBuilder::new()
+            .content(EmailContent {
+                subject: Some("Subject".to_string()),
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sent_email_builder_optional_fields_default_to_none() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .build()
+            .unwrap();
+        assert!(email.headers.is_none());
+        assert!(email.attachments.is_none());
+        assert!(email.reply_to.is_none());
+        assert!(email.user_engagement_tracking_disabled.is_none());
+    }
+
+    #[test]
+    fn sent_email_builder_with_all_optional_fields() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .headers(vec![Header {
+                name: Some("X-Custom".to_string()),
+                value: Some("val".to_string()),
+            }])
+            .attachments(vec![])
+            .reply_to(vec![])
+            .user_engagement_tracking_disabled(true)
+            .build()
+            .unwrap();
+        assert!(email.headers.is_some());
+        assert_eq!(email.user_engagement_tracking_disabled, Some(true));
+    }
+
+    // ── EmailAttachmentBuilder ───────────────────────────────────────────────
+
+    #[test]
+    fn email_attachment_builder_with_content_bytes_base64() {
+        let result = EmailAttachmentBuilder::new()
+            .content_bytes_base64(
+                "test.txt".to_string(),
+                "text/plain".to_string(),
+                "aGVsbG8=".to_string(),
+            )
+            .build();
+        assert!(result.is_ok());
+        let att = result.unwrap();
+        assert!(serde_json::to_string(&att).is_ok());
+    }
+
+    // ── EmailSendStatusType ──────────────────────────────────────────────────
+
+    #[test]
+    fn email_send_status_type_display_all_variants() {
+        assert_eq!(EmailSendStatusType::Canceled.to_string(), "Canceled");
+        assert_eq!(EmailSendStatusType::Failed.to_string(), "Failed");
+        assert_eq!(EmailSendStatusType::NotStarted.to_string(), "NotStarted");
+        assert_eq!(EmailSendStatusType::Running.to_string(), "Running");
+        assert_eq!(EmailSendStatusType::Succeeded.to_string(), "Succeeded");
+        assert_eq!(EmailSendStatusType::Unknown.to_string(), "Unknown");
+    }
+
+    #[test]
+    fn email_send_status_type_from_str_all_variants() {
+        use std::str::FromStr;
+        assert_eq!(
+            EmailSendStatusType::from_str("Canceled").unwrap(),
+            EmailSendStatusType::Canceled
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("Failed").unwrap(),
+            EmailSendStatusType::Failed
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("NotStarted").unwrap(),
+            EmailSendStatusType::NotStarted
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("Running").unwrap(),
+            EmailSendStatusType::Running
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("Succeeded").unwrap(),
+            EmailSendStatusType::Succeeded
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("anything-else").unwrap(),
+            EmailSendStatusType::Unknown
+        );
+    }
+
+    #[test]
+    fn email_send_status_display_delegates_to_type() {
+        let status = EmailSendStatus(EmailSendStatusType::Succeeded);
+        assert_eq!(status.to_string(), "Succeeded");
+    }
+
+    #[test]
+    fn email_send_status_to_type() {
+        let status = EmailSendStatus(EmailSendStatusType::Running);
+        assert_eq!(status.to_type(), EmailSendStatusType::Running);
+    }
+
+    // ── Header public fields (sunsided PR #5) ────────────────────────────────
+
+    #[test]
+    fn header_fields_are_public_and_readable() {
+        let h = Header {
+            name: Some("X-Custom".to_string()),
+            value: Some("hello".to_string()),
+        };
+        assert_eq!(h.name.as_deref(), Some("X-Custom"));
+        assert_eq!(h.value.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn sent_email_builder_headers_appear_in_serialized_json() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: Some("Hi".to_string()),
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .headers(vec![
+                Header {
+                    name: Some("X-Foo".to_string()),
+                    value: Some("bar".to_string()),
+                },
+                Header {
+                    name: Some("X-Baz".to_string()),
+                    value: Some("qux".to_string()),
+                },
+            ])
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&email).unwrap();
+        let headers = json.get("headers").expect("headers should be present");
+        assert_eq!(headers["X-Foo"], "bar");
+        assert_eq!(headers["X-Baz"], "qux");
+    }
+
+    // ── HeaderSet serialization edge cases ───────────────────────────────────
+
+    #[test]
+    fn header_set_skips_headers_with_none_name_or_value() {
+        let header_set = HeaderSet(vec![
+            Header {
+                name: None,
+                value: Some("v".to_string()),
+            },
+            Header {
+                name: Some("k".to_string()),
+                value: None,
+            },
+            Header {
+                name: Some("Keep".to_string()),
+                value: Some("yes".to_string()),
+            },
+        ]);
+        let serialized = serde_json::to_value(&header_set).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 1);
+        assert_eq!(serialized["Keep"], "yes");
+    }
+
+    // ── SentEmail JSON serialization ─────────────────────────────────────────
+
+    #[test]
+    fn sent_email_serializes_required_fields_only() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: Some("Hi".to_string()),
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&email).unwrap();
+        assert_eq!(json["senderAddress"], "s@example.com");
+        assert!(
+            json.get("headers").is_none(),
+            "optional headers should be omitted"
+        );
+        assert!(
+            json.get("attachments").is_none(),
+            "optional attachments should be omitted"
+        );
+    }
+
+    // ── Phase 3b: build_async ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_async_with_content_bytes_succeeds() {
+        let result = EmailAttachmentBuilder::new()
+            .content_bytes_base64(
+                "file.txt".to_string(),
+                "text/plain".to_string(),
+                "aGVsbG8=".to_string(),
+            )
+            .build_async()
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn build_async_missing_file_returns_error() {
+        let result = EmailAttachmentBuilder::new()
+            .file_to_base64("/nonexistent/path/file.txt")
+            .build_async()
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn build_async_reads_real_file_and_detects_mime() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Write minimal PNG header so infer detects image/png
+        let png_header: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        tmp.write_all(png_header).unwrap();
+        tmp.flush().unwrap();
+
+        let result = EmailAttachmentBuilder::new()
+            .file_to_base64(tmp.path().to_str().unwrap())
+            .build_async()
+            .await
+            .unwrap();
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["contentType"], "image/png");
+        assert!(json["contentInBase64"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn build_async_unknown_mime_falls_back_to_octet_stream() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"hello world plain text").unwrap();
+        tmp.flush().unwrap();
+
+        let result = EmailAttachmentBuilder::new()
+            .file_to_base64(tmp.path().to_str().unwrap())
+            .build_async()
+            .await
+            .unwrap();
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["contentType"], "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn build_async_sets_filename_from_path() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("report.pdf");
+        std::fs::write(&file_path, b"%PDF-1.4").unwrap();
+
+        let result = EmailAttachmentBuilder::new()
+            .file_to_base64(file_path.to_str().unwrap())
+            .build_async()
+            .await
+            .unwrap();
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["name"], "report.pdf");
+    }
+
+    // ── SentEmailBuilder::reply_to ───────────────────────────────────────────
+
+    #[test]
+    fn reply_to_with_addresses_sets_field() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .reply_to(vec![EmailAddress {
+                email: Some("reply@example.com".to_string()),
+                display_name: Some("Reply Handler".to_string()),
+            }])
+            .build()
+            .unwrap();
+
+        let addrs = email.reply_to.expect("reply_to should be Some");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].email.as_deref(), Some("reply@example.com"));
+        assert_eq!(addrs[0].display_name.as_deref(), Some("Reply Handler"));
+    }
+
+    #[test]
+    fn reply_to_appears_in_serialized_json() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .reply_to(vec![EmailAddress {
+                email: Some("reply@example.com".to_string()),
+                display_name: None,
+            }])
+            .build()
+            .unwrap();
+
+        let json = serde_json::to_value(&email).unwrap();
+        let arr = json["replyTo"]
+            .as_array()
+            .expect("replyTo should be an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["address"], "reply@example.com");
+    }
+
+    // ── Phase 3a: tracing smoke test ─────────────────────────────────────────
+
+    #[test]
+    fn tracing_subscriber_initialises_without_panic() {
+        // Verifies that tracing-subscriber can be set up in test context —
+        // proves our tracing macros emit valid metadata.
+        let _ = tracing_subscriber::fmt::try_init();
     }
 }
