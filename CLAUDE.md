@@ -23,6 +23,15 @@ cargo run --example mail_attach                      # async example with attach
 RUST_LOG=debug cargo run --example mail              # with debug logging
 ```
 
+## Git hooks
+
+A pre-push hook lives in `hooks/pre-push`. It runs `cargo fmt --check` and `cargo clippy -- -D warnings` before every push, catching CI failures locally. Install it once per clone:
+
+```bash
+cp hooks/pre-push .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
+```
+
 ## Testing
 
 All tests run with `cargo test` — no Azure credentials or network access required.

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -e
+
+echo "--- pre-push: cargo fmt --check"
+cargo fmt --check
+
+echo "--- pre-push: cargo clippy -- -D warnings"
+cargo clippy -- -D warnings
+
+echo "--- pre-push: all checks passed"
