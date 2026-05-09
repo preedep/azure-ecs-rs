@@ -229,6 +229,10 @@ Then run with `RUST_LOG=debug` to see library spans alongside application logs.
 
 Prefix any example with `RUST_LOG=debug` to enable tracing output.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## Get email credentials from Azure Portal
 
 - **Connection String**
