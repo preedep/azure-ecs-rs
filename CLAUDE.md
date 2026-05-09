@@ -236,3 +236,98 @@ Rules applied in this codebase. Follow them when adding or reviewing code.
 
 - `send_emails_batch` uses `futures::future::join_all` over `&[SentEmail]` — all sends share the same `reqwest::Client` connection pool, so concurrency is free beyond the first request.
 - `CancellationToken` polling uses `tokio::select!` to race the sleep against cancellation — do not replace with manual flag polling or channel receives, which are less efficient and harder to reason about.
+
+### Zero-copy and memory layout
+
+The goal is to pass data through the call stack without unnecessary heap copies. Apply these rules when adding new fields, method parameters, or internal helpers.
+
+#### Borrow instead of own at function boundaries
+
+Prefer `&str` over `String` and `&[u8]` over `Vec<u8>` for read-only parameters. The caller owns the data; the callee only needs a view.
+
+```rust
+// Bad — forces the caller to allocate even when they have a &str
+fn set_host(host: String) { … }
+
+// Good — caller decides ownership; &str, String, Arc<str> all accepted
+fn set_host(host: &str) { … }
+// Builder setters in this codebase already follow this: .host("example.com")
+```
+
+#### Use `Cow<'_, str>` on return paths that sometimes own, sometimes borrow
+
+When a function returns a string that is *sometimes* a static literal and *sometimes* a freshly allocated `String` (e.g., error messages, MIME fallbacks), `Cow` avoids forcing an allocation on the literal path.
+
+```rust
+// Bad — always allocates, even for the static fallback
+fn mime_or_default(buf: &[u8]) -> String {
+    infer::get(buf)
+        .map(|t| t.mime_type().to_string())   // allocates
+        .unwrap_or_else(|| "application/octet-stream".to_string()) // allocates
+}
+
+// Good — borrows the &'static str when possible; only allocates for inferred type
+fn mime_or_default(buf: &[u8]) -> Cow<'static, str> {
+    infer::get(buf)
+        .map(|t| Cow::Owned(t.mime_type().to_string()))
+        .unwrap_or(Cow::Borrowed("application/octet-stream"))
+}
+```
+
+> The current codebase converts directly to `String` because `attachment_type: Option<String>` requires it. If that field changes to `Option<Cow<'static, str>>` in a future version this pattern becomes free.
+
+#### `Arc<str>` for shared read-only strings across tasks
+
+When the same string must be readable from multiple Tokio tasks, `Arc<str>` is cheaper than cloning a `String` into each task. The clone is a single atomic increment; the heap data is never copied.
+
+```rust
+// Bad — clones the heap content into every spawned task
+let id: String = send_email(…).await?;
+for _ in 0..workers {
+    let id = id.clone();           // full heap copy each time
+    tokio::spawn(async move { poll_status(&id).await });
+}
+
+// Good — one allocation, N atomic increments
+let id: Arc<str> = Arc::from(send_email(…).await?);
+for _ in 0..workers {
+    let id = Arc::clone(&id);      // pointer copy only
+    tokio::spawn(async move { poll_status(&id).await });
+}
+```
+
+> In this codebase the public callback API takes `String`, so `Arc<str>` is used only internally where the string does not cross the public boundary. When the callback signature is revised, prefer `Arc<str>` or `&str` over `String`.
+
+#### Do not copy attachment bytes more than once
+
+The base64 encoding path is: `Vec<u8>` (file read) → base64 `String` (encode). This is unavoidable — base64 expands the data by ~33 % and must be a new allocation. Do not add intermediate copies between the raw bytes and the encoder:
+
+```rust
+// Bad — copies raw bytes into a second Vec before encoding
+let copy = buffer.clone();
+let encoded = general_purpose::STANDARD.encode(&copy);
+
+// Good — encode directly from the buffer returned by fs::read
+let encoded = general_purpose::STANDARD.encode(&buffer);
+```
+
+#### Avoid re-encoding already-encoded content
+
+`EmailAttachmentBuilder::content_bytes_base64()` accepts pre-encoded base64. Do not base64-encode content that is already base64 — callers loading from disk should use `file_to_base64()` + `build_async()` and let the builder encode once.
+
+#### String capacity pre-allocation for URL construction
+
+`format!` with multiple segments allocates a fresh `String` sized to the result. For URLs built in hot loops (retry, batch), pre-allocate with `String::with_capacity` if the final length is known:
+
+```rust
+// Current (acceptable for cold path — format! allocates once):
+let url = format!("{}/emails:send?api-version={}", base_url, api_version.as_str());
+
+// For a hot loop with known segment lengths:
+let mut url = String::with_capacity(base_url.len() + 32);
+url.push_str(base_url);
+url.push_str("/emails:send?api-version=");
+url.push_str(api_version.as_str());
+```
+
+> The retry loop in `handle_response_and_retry_if_needed` re-uses the `url: &str` reference — no re-allocation occurs on retries. The `with_capacity` pattern is only relevant if a future change builds the URL inside the retry body.
