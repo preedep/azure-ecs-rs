@@ -1,5 +1,10 @@
 # Azure Email Communication Service for Rust (azure-ecs-rs)
 
+[![Crates.io](https://img.shields.io/crates/v/azure-ecs-rs.svg)](https://crates.io/crates/azure-ecs-rs)
+[![docs.rs](https://img.shields.io/docsrs/azure-ecs-rs)](https://docs.rs/azure-ecs-rs)
+[![CI](https://github.com/preedep/azure-ecs-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/preedep/azure-ecs-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Azure Email Communication Service is part of the Azure Communication Services. It provides a REST API to send emails.
 For more information, see the [Azure Communication Services documentation](https://learn.microsoft.com/en-us/azure/communication-services/).
 

@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.2.0] — unreleased
+## [0.2.0] — 2026-05-09
 
 ### Added
 - **Typed errors** — `ACSError` enum (`Network`, `InvalidUrl`, `Serialization`, `Deserialization`, `Auth`, `Header`, `Api`, `MissingField`, `RateLimitExceeded`) via `thiserror`. Public API return type changes from `ErrorResponse` to `ACSError`. ([ROADMAP Phase 1])
