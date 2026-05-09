@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                                          # build
-cargo test                                           # run all 110 tests (unit + integration)
+cargo test                                           # run all 136 tests (unit + integration)
 cargo clippy -- -D warnings                          # lint (must pass clean for CI)
 cargo fmt --check                                    # format check (must pass clean for CI)
 cargo test <name>                                    # run a single test by name substring
@@ -206,3 +206,33 @@ Significant design decisions are captured in `docs/adr/`:
 **CI** runs two jobs in parallel: `test` (`cargo build` + `cargo test`) and `lint` (`cargo clippy -- -D warnings` + `cargo fmt --check`).
 
 **Release** requires the git tag to match the version in `Cargo.toml`, then runs full CI, publishes to crates.io (`CARGO_REGISTRY_TOKEN` secret required), and creates a GitHub Release with auto-generated notes.
+
+## Rust performance patterns
+
+Rules applied in this codebase. Follow them when adding or reviewing code.
+
+### Allocations
+
+| Pattern | Avoid | Prefer |
+|---|---|---|
+| String from `&'static str` | `"literal".to_string()` when a zero-alloc alternative exists | `String::new()` for empty, `string.to_owned()` / `into_owned()` when already have a `Cow` |
+| `Cow<str>` to `String` | `.to_string_lossy().to_string()` (two steps, may allocate twice) | `.to_string_lossy().into_owned()` (one step, returns the `Owned` variant directly) |
+| `String` re-clone | `.to_string()` on a value already `String` | move or borrow; only clone when two owners are genuinely needed |
+| Intermediate collection | Building a temporary `Vec` / `BTreeMap` just to iterate it | Two-pass iterator (`.count()` then re-iterate) or `serialize_map(None)` |
+| MIME detection | `infer::Infer::new().get(buf)` (creates struct per call) | `infer::get(buf)` (free function, same cost, clearer intent) |
+
+### Async / blocking
+
+- **Never call `std::fs` inside a Tokio task.** `EmailAttachmentBuilder::build()` does blocking I/O — always use `build_async()` in async contexts to avoid blocking the executor thread.
+- Hold `Arc<reqwest::Client>` / clone `ACSClient` (cheap) — never call `ACSClientBuilder::build()` inside a hot loop; it re-creates the TLS connection pool.
+- Prefer `tokio::sync::Mutex` over `std::sync::Mutex` when the lock is held across `.await` points.
+
+### Serialization
+
+- `HeaderSet::Serialize` uses `serialize_map` with a two-pass count to avoid a `BTreeMap` allocation per email send. Keep this pattern for any custom `Serialize` impl that knows its element count up front.
+- `skip_serializing_if = "Option::is_none"` is set on every optional field in `SentEmail` — do not remove these attributes; they prevent sending `null` fields to the ACS API.
+
+### Concurrency
+
+- `send_emails_batch` uses `futures::future::join_all` over `&[SentEmail]` — all sends share the same `reqwest::Client` connection pool, so concurrency is free beyond the first request.
+- `CancellationToken` polling uses `tokio::select!` to race the sleep against cancellation — do not replace with manual flag polling or channel receives, which are less efficient and harder to reason about.
