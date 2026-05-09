@@ -9,8 +9,6 @@ jobs:
   e2e:
     name: Azure E2E tests
     runs-on: ubuntu-latest
-    # Skip if the required secret is not configured (forks, PRs from forks).
-    if: ${{ secrets.CONNECTION_STR != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -28,4 +26,9 @@ jobs:
           CLIENT_ID:      ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET:  ${{ secrets.CLIENT_SECRET }}
           ASC_URL:        ${{ secrets.ASC_URL }}
-        run: cargo test --test azure_e2e -- --include-ignored --nocapture
+        run: |
+          if [ -z "$CONNECTION_STR" ]; then
+            echo "CONNECTION_STR secret not configured — skipping Azure E2E tests"
+            exit 0
+          fi
+          cargo test --test azure_e2e -- --include-ignored --nocapture
