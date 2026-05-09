@@ -78,11 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     match res {
-        Ok((id,rx)) => {
-            if let _ = rx.await {
-                info!("Email sent successfully with id: {}", id);
-            }
-        },
+        Ok((id, rx)) => {
+            let _ = rx.await;
+            info!("Email sent successfully with id: {}", id);
+        }
         Err(e) => error!("Failed to send email: {:?}", e),
     }
     Ok(())

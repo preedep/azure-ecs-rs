@@ -2,7 +2,7 @@ use crate::domain::entities::models::EndPointParams;
 use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};
 use httpdate::fmt_http_date;
-use log::debug;
+use tracing::debug;
 use reqwest::header::HeaderMap;
 use sha2::{Digest, Sha256};
 use std::time::SystemTime;
@@ -196,5 +196,103 @@ mod tests {
         let access_key = "invalid base64";
         let result = get_request_header(&url, http_method, request_id, json_payload, access_key);
         assert!(result.is_err());
+    }
+
+    // ── compute_content_sha256 ────────────────────────────────────────────────
+
+    #[test]
+    fn compute_content_sha256_empty_string() {
+        // SHA-256("") = e3b0c44298fc1c149afb...  base64 = 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+        let hash = compute_content_sha256("");
+        assert_eq!(hash, "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=");
+    }
+
+    #[test]
+    fn compute_content_sha256_known_value() {
+        // SHA-256("{}") base64
+        let hash = compute_content_sha256("{}");
+        assert!(!hash.is_empty());
+        // deterministic — same input always yields same output
+        assert_eq!(hash, compute_content_sha256("{}"));
+    }
+
+    // ── compute_signature ────────────────────────────────────────────────────
+
+    #[test]
+    fn compute_signature_valid_secret_returns_ok() {
+        let secret = "c2VjcmV0"; // base64("secret")
+        let result = compute_signature("string-to-sign", secret);
+        assert!(result.is_ok());
+        assert!(!result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn compute_signature_is_deterministic() {
+        let secret = "c2VjcmV0";
+        let a = compute_signature("msg", secret).unwrap();
+        let b = compute_signature("msg", secret).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_signature_differs_for_different_messages() {
+        let secret = "c2VjcmV0";
+        let a = compute_signature("msg1", secret).unwrap();
+        let b = compute_signature("msg2", secret).unwrap();
+        assert_ne!(a, b);
+    }
+
+    // ── parse_endpoint ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_endpoint_strips_https_from_host() {
+        let result = parse_endpoint("endpoint=https://my.host.com;accesskey=key").unwrap();
+        assert_eq!(result.host_name, "my.host.com");
+    }
+
+    #[test]
+    fn parse_endpoint_missing_accesskey_prefix() {
+        let result = parse_endpoint("endpoint=https://example.com;key=value");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_missing_endpoint_prefix() {
+        let result = parse_endpoint("host=https://example.com;accesskey=key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_too_few_parts() {
+        let result = parse_endpoint("endpoint=https://example.com");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_too_many_parts() {
+        let result = parse_endpoint("endpoint=https://example.com;accesskey=key;extra=val");
+        assert!(result.is_err());
+    }
+
+    // ── get_request_header – header presence ─────────────────────────────────
+
+    #[test]
+    fn get_request_header_contains_all_required_headers() {
+        let url = Url::parse("https://example.com/emails:send?api-version=2023-03-31").unwrap();
+        let headers = get_request_header(&url, "POST", "req-id", "{}", "c2VjcmV0").unwrap();
+        assert!(headers.contains_key("authorization"));
+        assert!(headers.contains_key("content-type"));
+        assert!(headers.contains_key("x-ms-date"));
+        assert!(headers.contains_key("x-ms-content-sha256"));
+        assert!(headers.contains_key("repeatability-request-id"));
+        assert!(headers.contains_key("repeatability-first-sent"));
+    }
+
+    #[test]
+    fn get_request_header_authorization_uses_hmac_sha256() {
+        let url = Url::parse("https://example.com/path").unwrap();
+        let headers = get_request_header(&url, "GET", "id", "{}", "c2VjcmV0").unwrap();
+        let auth = headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(auth.starts_with("HMAC-SHA256"));
     }
 }
