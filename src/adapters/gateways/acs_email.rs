@@ -805,7 +805,7 @@ async fn get_access_token(
         }
         _ => {}
     }
-    Ok("".to_string())
+    Ok(String::new())
 }
 
 /// Create headers for the request based on the provided authentication method.
