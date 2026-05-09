@@ -1134,6 +1134,64 @@ mod tests {
         assert_eq!(json["name"], "report.pdf");
     }
 
+    // ── SentEmailBuilder::reply_to ───────────────────────────────────────────
+
+    #[test]
+    fn reply_to_with_addresses_sets_field() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .reply_to(vec![EmailAddress {
+                email: Some("reply@example.com".to_string()),
+                display_name: Some("Reply Handler".to_string()),
+            }])
+            .build()
+            .unwrap();
+
+        let addrs = email.reply_to.expect("reply_to should be Some");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].email.as_deref(), Some("reply@example.com"));
+        assert_eq!(addrs[0].display_name.as_deref(), Some("Reply Handler"));
+    }
+
+    #[test]
+    fn reply_to_appears_in_serialized_json() {
+        let email = SentEmailBuilder::new()
+            .sender("s@example.com".to_string())
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
+            .reply_to(vec![EmailAddress {
+                email: Some("reply@example.com".to_string()),
+                display_name: None,
+            }])
+            .build()
+            .unwrap();
+
+        let json = serde_json::to_value(&email).unwrap();
+        let arr = json["replyTo"]
+            .as_array()
+            .expect("replyTo should be an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["address"], "reply@example.com");
+    }
+
     // ── Phase 3a: tracing smoke test ─────────────────────────────────────────
 
     #[test]

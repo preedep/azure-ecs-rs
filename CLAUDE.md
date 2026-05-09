@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                                          # build
-cargo test                                           # run all 103 tests (unit + integration)
+cargo test                                           # run all 110 tests (unit + integration)
 cargo clippy -- -D warnings                          # lint (must pass clean for CI)
 cargo fmt --check                                    # format check (must pass clean for CI)
 cargo test <name>                                    # run a single test by name substring
@@ -42,9 +42,9 @@ Inline in each module under `#[cfg(test)]`:
 
 | Module | What is tested |
 |---|---|
-| `acs_email.rs` | `ACSApiVersion` variants/default, `ACSClientBuilder` all construction paths + error messages + `max_retries` + `timeout`, `parse_url`, `serialize_body`, all error helpers, `ACSError` Display/From/RateLimitExceeded, `wrap_http_client`, `is_terminal_status` all variants |
+| `acs_email.rs` | `ACSApiVersion` variants/default, `ACSClientBuilder` all construction paths + `host()` base-URL formation + error messages + `max_retries` + `timeout`, `parse_url`, `serialize_body`, all error helpers, `ACSError` Display/From/RateLimitExceeded, `wrap_http_client`, `is_terminal_status` all variants |
 | `acs_shared_key.rs` | `compute_content_sha256` known SHA-256 vectors, `compute_signature` (valid, invalid, determinism, divergence), `parse_endpoint` all error cases, `get_request_header` all required headers + HMAC-SHA256 Authorization scheme |
-| `models.rs` | `SentEmailBuilder` (success, all missing-field errors, optional fields), `EmailAttachmentBuilder` sync + async (`build_async`: valid file, missing file, MIME detection for PNG/octet-stream, filename extraction), `EmailSendStatusType` Display + `FromStr` all variants, `EmailSendStatus` Display + `to_type`, `HeaderSet` serde round-trip, `SentEmail` JSON serialization, tracing subscriber smoke test |
+| `models.rs` | `SentEmailBuilder` (success, all missing-field errors, optional fields, `reply_to` with real addresses + JSON serialization), `EmailAttachmentBuilder` sync + async (`build_async`: valid file, missing file, MIME detection for PNG/octet-stream, filename extraction), `EmailSendStatusType` Display + `FromStr` all variants, `EmailSendStatus` Display + `to_type`, `HeaderSet` serde round-trip, `SentEmail` JSON serialization, tracing subscriber smoke test |
 
 ### Integration tests (wiremock)
 
@@ -59,6 +59,9 @@ Live in `mod integration_tests` inside `acs_email.rs`. Use `wiremock` to start a
 | `get_email_status_succeeded` | 200 `"Succeeded"` → `EmailSendStatusType::Succeeded` |
 | `get_email_status_running` | 200 `"Running"` → `EmailSendStatusType::Running` |
 | `get_email_status_api_error_on_404` | 404 → `ACSError::Api` |
+| `send_email_stream_returns_error_when_send_fails` | Send 500 → stream itself returns `Err` before yielding |
+| `send_email_stream_yields_terminal_status_and_stops` | Send 202, status Succeeded → stream yields one item then terminates |
+| `send_email_stream_stops_on_status_error` | Send 202, status 404 → stream yields `Err` then terminates |
 
 **How it works:** `ACSClientBuilder` has a `#[cfg(test)] pub(crate) fn base_url_override(url: &str)` method that replaces the computed `https://<host>` with the wiremock server URI. Auth headers are computed with a dummy shared key; the mock server ignores them.
 

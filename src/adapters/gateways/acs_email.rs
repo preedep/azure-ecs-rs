@@ -1258,6 +1258,31 @@ mod tests {
         assert_eq!(DEFAULT_MAX_RETRIES, 3);
     }
 
+    // ── ACSClientBuilder::host ────────────────────────────────────────────────
+
+    #[test]
+    fn builder_host_sets_hostname_used_for_base_url() {
+        // Verify that .host() is accepted and .build() succeeds, producing a
+        // client whose base_url carries the https:// scheme prefix.
+        let client = ACSClientBuilder::new()
+            .host("my.host.example.com")
+            .managed_identity()
+            .build()
+            .unwrap();
+        assert!(client.base_url.starts_with("https://"));
+        assert!(client.base_url.contains("my.host.example.com"));
+    }
+
+    #[test]
+    fn builder_host_service_principal_sets_base_url() {
+        let client = ACSClientBuilder::new()
+            .host("sp.example.com")
+            .service_principal("tenant", "client_id", "secret")
+            .build()
+            .unwrap();
+        assert_eq!(client.base_url, "https://sp.example.com");
+    }
+
     // ── Phase 4: is_terminal_status ──────────────────────────────────────────
 
     #[test]
@@ -1630,6 +1655,81 @@ mod integration_tests {
         let client = client_for(&server);
         let result = client.send_email(&minimal_email()).await;
         assert!(matches!(result, Err(ACSError::Deserialization(_))));
+    }
+
+    // ── send_email_stream ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_stream_returns_error_when_send_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": { "code": "InternalError", "message": "server fault" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let result = client.send_email_stream(&minimal_email()).await;
+        assert!(matches!(result, Err(ACSError::Api { .. })));
+    }
+
+    #[tokio::test]
+    async fn send_email_stream_yields_terminal_status_and_stops() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "stream-op" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/stream-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "stream-op",
+                "status": "Succeeded"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let (message_id, stream) = client.send_email_stream(&minimal_email()).await.unwrap();
+        assert_eq!(message_id, "stream-op");
+
+        tokio::pin!(stream);
+        use futures::StreamExt;
+        let mut statuses = Vec::new();
+        while let Some(item) = stream.next().await {
+            statuses.push(item.unwrap());
+        }
+        assert_eq!(statuses, vec![EmailSendStatusType::Succeeded]);
+    }
+
+    #[tokio::test]
+    async fn send_email_stream_stops_on_status_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "err-op" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/err-op"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NotFound", "message": "operation not found" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let (_, stream) = client.send_email_stream(&minimal_email()).await.unwrap();
+
+        tokio::pin!(stream);
+        use futures::StreamExt;
+        let first = stream.next().await.expect("stream should yield one item");
+        assert!(matches!(first, Err(ACSError::Api { .. })));
+        // stream must terminate after an error
+        assert!(stream.next().await.is_none());
     }
 
     // ── handle_response_and_retry_if_needed: Retry-After header ──────────────
