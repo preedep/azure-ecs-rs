@@ -23,10 +23,16 @@ fn get_env_var(name: &str) -> String {
 fn handle_error(err: ACSError) {
     match err {
         ACSError::RateLimitExceeded { retries } => {
-            warn!(retries, "Rate limit hit after all retries — implement back-off at call site");
+            warn!(
+                retries,
+                "Rate limit hit after all retries — implement back-off at call site"
+            );
         }
         ACSError::Auth(msg) => {
-            error!(msg, "Authentication failed — check credentials or managed identity binding");
+            error!(
+                msg,
+                "Authentication failed — check credentials or managed identity binding"
+            );
         }
         ACSError::Api { code, message } => {
             error!(code = ?code, message, "ACS API returned an error");
@@ -35,7 +41,10 @@ fn handle_error(err: ACSError) {
             error!(msg, "Network error — check connectivity and endpoint URL");
         }
         ACSError::Deserialization(msg) => {
-            error!(msg, "Unexpected response shape from ACS — may indicate API version mismatch");
+            error!(
+                msg,
+                "Unexpected response shape from ACS — may indicate API version mismatch"
+            );
         }
         other => {
             error!(err = %other, "Unhandled ACS error");

@@ -1,3 +1,43 @@
+//! HTTP client for the Azure Email Communication Service (ACS) data-plane API.
+//!
+//! # Architecture
+//!
+//! - [`ACSClientBuilder`] — fluent builder; validates configuration and constructs
+//!   the shared [`reqwest::Client`] once so all requests reuse the same connection pool.
+//! - [`ACSClient`] — clone-cheap handle (all fields behind `Arc` or `Clone`).
+//!   Owns the HTTP client and dispatches the three public operations:
+//!   [`send_email`], [`send_email_with_callback`], [`send_email_stream`], and
+//!   [`get_email_status`].
+//!
+//! # Retry behaviour
+//!
+//! `429 Too Many Requests` and `503 Service Unavailable` responses trigger automatic
+//! retries.  The delay is taken from the `Retry-After` response header when present;
+//! otherwise exponential backoff (`2^n` seconds, n = retry index) is used.
+//! When all retries are exhausted the call fails with
+//! [`ACSError::RateLimitExceeded`].  Set `.max_retries(0)` to disable retries.
+//!
+//! # Authentication
+//!
+//! The auth method is selected at build time and baked into [`ACSClient`]:
+//!
+//! | Method | `Authorization` header strategy |
+//! |---|---|
+//! | [`SharedKey`] | HMAC-SHA256 signed per-request (see `acs_shared_key`) |
+//! | [`ServicePrincipal`] | OAuth2 client-credentials token via `azure_identity` |
+//! | [`ManagedIdentity`] | Ambient managed-identity token via `azure_identity` |
+//!
+//! Token acquisition for service principal / managed identity happens inside
+//! each request; responses are not cached.
+//!
+//! [`send_email`]: ACSClient::send_email
+//! [`send_email_with_callback`]: ACSClient::send_email_with_callback
+//! [`send_email_stream`]: ACSClient::send_email_stream
+//! [`get_email_status`]: ACSClient::get_email_status
+//! [`SharedKey`]: ACSAuthMethod::SharedKey
+//! [`ServicePrincipal`]: ACSAuthMethod::ServicePrincipal
+//! [`ManagedIdentity`]: ACSAuthMethod::ManagedIdentity
+
 // License: MIT
 // This file is part of the Azure Communication Services Email Client Library, an open-source project.
 // This source code is licensed under the MIT license found in the LICENSE file in the root directory of this source tree.
@@ -11,23 +51,36 @@ use azure_core::auth::TokenCredential;
 use azure_core::HttpClient;
 use azure_identity::{create_credential, ClientSecretCredential};
 use futures::stream::Stream;
-use tracing::{debug, error, instrument};
 use reqwest::header::RETRY_AFTER;
 use reqwest::{Client, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
+use tracing::{debug, error, instrument};
 use url::Url;
 use uuid::Uuid;
 
 type EmailResult<T> = Result<T, ACSError>;
 
-/// ACS Email REST API version selector. Defaults to `V20230331` for backward compatibility.
+/// Selects the ACS Email REST API version used for all requests on an [`ACSClient`].
+///
+/// The default is [`V20230331`] for backward compatibility.  Opt in to
+/// [`V20250901`] via [`ACSClientBuilder::api_version`] when you need explicit
+/// version pinning.
+///
+/// **Note:** the data-plane endpoint exposes identical operations in both
+/// versions.  Suppression-list management (opt-out) lives on the ARM management
+/// plane and is not part of this client.  See `docs/adr/ADR-001` for details.
+///
+/// [`V20230331`]: ACSApiVersion::V20230331
+/// [`V20250901`]: ACSApiVersion::V20250901
 #[derive(Clone, Default, Debug)]
 pub enum ACSApiVersion {
+    /// `2023-03-31` — default; backward-compatible with all prior releases.
     #[default]
     V20230331,
+    /// `2025-09-01` — latest stable; use for explicit version pinning.
     V20250901,
 }
 
@@ -55,6 +108,18 @@ enum ACSAuthMethod {
 /// Default number of retries for `429 Too Many Requests` and `503 Service Unavailable` responses.
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
+/// Async HTTP client for the ACS Email data-plane API.
+///
+/// Construct via [`ACSClientBuilder`].  The client is cheap to clone — the
+/// underlying [`reqwest::Client`] (and its connection pool) is shared across
+/// all clones.
+///
+/// # Thread safety
+///
+/// `ACSClient` implements [`Clone`] and is `Send + Sync`; it can be wrapped in
+/// an [`Arc`] and shared across threads or tasks without additional locking.
+///
+/// [`Arc`]: std::sync::Arc
 #[derive(Clone)]
 pub struct ACSClient {
     host: String,
@@ -65,6 +130,20 @@ pub struct ACSClient {
     max_retries: u32,
 }
 
+/// Fluent builder for [`ACSClient`].
+///
+/// Call [`ACSClientBuilder::new`] (or `ACSClientBuilder::default()`), chain
+/// the configuration methods you need, then call [`build`] to obtain a
+/// validated [`ACSClient`].
+///
+/// # Required fields
+///
+/// Exactly one of the following must be set:
+/// - `.connection_string(…)` for shared-key auth, **or**
+/// - `.host(…)` + `.service_principal(…)` for service principal auth, **or**
+/// - `.host(…)` + `.managed_identity()` for managed identity auth.
+///
+/// [`build`]: ACSClientBuilder::build
 pub struct ACSClientBuilder {
     host: Option<String>,
     connection_string: Option<String>,
@@ -174,7 +253,8 @@ impl ACSClientBuilder {
             let parsed_res = parse_endpoint(&connection_string)
                 .map_err(|e| format!("Failed to parse connection string: {}", e))?;
             let host = parsed_res.host_name;
-            let base_url = self.base_url_override
+            let base_url = self
+                .base_url_override
                 .unwrap_or_else(|| format!("https://{}", host));
             let auth_method = ACSAuthMethod::SharedKey(parsed_res.access_key);
             return Ok(ACSClient {
@@ -188,8 +268,11 @@ impl ACSClientBuilder {
         }
 
         let host = self.host.ok_or_else(|| "Host is required".to_string())?;
-        let clean_host = host.trim_start_matches("https://").trim_start_matches("http://");
-        let base_url = self.base_url_override
+        let clean_host = host
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let base_url = self
+            .base_url_override
             .unwrap_or_else(|| format!("https://{}", clean_host));
         let auth_method = self
             .auth_method
@@ -206,30 +289,69 @@ impl ACSClientBuilder {
 }
 
 impl ACSClient {
-    /// Send an email using the ACS client.
+    /// Submit an email for delivery and return the ACS operation ID.
     ///
-    /// # Arguments
+    /// The returned `String` is the opaque operation ID (message ID) assigned by
+    /// ACS.  Pass it to [`get_email_status`] or use [`send_email_stream`] /
+    /// [`send_email_with_callback`] to track delivery.
     ///
-    /// * `email` - A reference to the `SentEmail` struct containing the email details.
+    /// Transient `429` / `503` responses are retried automatically up to
+    /// `max_retries` times (default: 3) with exponential back-off.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// * `EmailResult<String>` - The result of the email send operation, containing the message ID if successful.
+    /// - [`ACSError::Network`] — request could not be sent.
+    /// - [`ACSError::Auth`] — token acquisition failed (service principal / managed identity).
+    /// - [`ACSError::Api`] — ACS returned a non-202 error response.
+    /// - [`ACSError::RateLimitExceeded`] — all retries exhausted on `429`/`503`.
+    ///
+    /// [`get_email_status`]: ACSClient::get_email_status
+    /// [`send_email_stream`]: ACSClient::send_email_stream
+    /// [`send_email_with_callback`]: ACSClient::send_email_with_callback
     #[instrument(skip(self, email), fields(host = %self.host, api_version = %self.api_version.as_str()))]
     pub async fn send_email(&self, email: &SentEmail) -> EmailResult<String> {
         let request_id = format!("{}", Uuid::new_v4());
-        acs_send_email(&self.http_client, &self.base_url, &self.auth_method, request_id.as_str(), email, &self.api_version, self.max_retries).await
+        acs_send_email(
+            &self.http_client,
+            &self.base_url,
+            &self.auth_method,
+            request_id.as_str(),
+            email,
+            &self.api_version,
+            self.max_retries,
+        )
+        .await
     }
-    /// Sends an email using the ACS client and periodically checks the status, invoking a callback function with the status.
+
+    /// Submit an email and receive delivery status updates via a callback.
     ///
-    /// # Arguments
-    ///
-    /// * `email` - A reference to the `SentEmail` struct containing the email details.
-    /// * `call_back` - A callback function that takes the message ID, email send status, and optional error details.
+    /// Sends the email, then spawns a Tokio task that polls
+    /// [`get_email_status`] every **5 seconds** and invokes `call_back` on each
+    /// update.  The task stops when a terminal status
+    /// (`Succeeded`, `Failed`, `Canceled`, `Unknown`) or a poll error is
+    /// observed.
     ///
     /// # Returns
     ///
-    /// * `EmailResult<String>` - The result of the email send operation, containing the message ID if successful.
+    /// A tuple `(message_id, done_rx)`.  Await `done_rx` to block until the
+    /// background task has finished (useful in tests or when you need to ensure
+    /// delivery completes before your process exits).
+    ///
+    /// # Callback signature
+    ///
+    /// ```text
+    /// fn(message_id: String, status: &EmailSendStatusType, error: Option<ACSError>)
+    /// ```
+    ///
+    /// `error` is `Some` only when a status-poll request itself fails; a
+    /// `Failed` delivery status still has `error = None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only if the initial *send* fails.  Poll errors are
+    /// delivered through the callback rather than propagated.
+    ///
+    /// [`get_email_status`]: ACSClient::get_email_status
     #[allow(dead_code)]
     #[instrument(skip(self, email, call_back), fields(host = %self.host, api_version = %self.api_version.as_str()))]
     pub async fn send_email_with_callback<F>(
@@ -241,8 +363,16 @@ impl ACSClient {
         F: Fn(String, &EmailSendStatusType, Option<ACSError>) + Send + Sync + 'static,
     {
         let request_id = format!("{}", Uuid::new_v4());
-        let result =
-            acs_send_email(&self.http_client, &self.base_url, &self.auth_method, request_id.as_str(), email, &self.api_version, self.max_retries).await?;
+        let result = acs_send_email(
+            &self.http_client,
+            &self.base_url,
+            &self.auth_method,
+            request_id.as_str(),
+            email,
+            &self.api_version,
+            self.max_retries,
+        )
+        .await?;
 
         let message_id = result.clone();
         let (tx, rx) = oneshot::channel();
@@ -296,10 +426,21 @@ impl ACSClient {
     pub async fn send_email_stream(
         &self,
         email: &SentEmail,
-    ) -> EmailResult<(String, impl Stream<Item = Result<EmailSendStatusType, ACSError>> + '_)> {
+    ) -> EmailResult<(
+        String,
+        impl Stream<Item = Result<EmailSendStatusType, ACSError>> + '_,
+    )> {
         let request_id = Uuid::new_v4().to_string();
-        let message_id =
-            acs_send_email(&self.http_client, &self.base_url, &self.auth_method, &request_id, email, &self.api_version, self.max_retries).await?;
+        let message_id = acs_send_email(
+            &self.http_client,
+            &self.base_url,
+            &self.auth_method,
+            &request_id,
+            email,
+            &self.api_version,
+            self.max_retries,
+        )
+        .await?;
 
         let returned_id = message_id.clone();
         let poll_stream = stream! {
@@ -322,18 +463,42 @@ impl ACSClient {
         Ok((returned_id, poll_stream))
     }
 
-    /// Get the status of a sent email using the ACS client.
+    /// Poll the delivery status of a previously submitted email.
     ///
-    /// # Arguments
+    /// `message_id` is the operation ID returned by [`send_email`].  ACS
+    /// processes delivery asynchronously; call this method periodically
+    /// (recommended: every 5 s) until a terminal status is observed:
     ///
-    /// * `message_id` - A reference to the message ID string.
+    /// | Status | Meaning |
+    /// |---|---|
+    /// | `NotStarted` | Queued, not yet processing |
+    /// | `Running` | In transit |
+    /// | `Succeeded` | Delivered to the recipient server |
+    /// | `Failed` | Permanent delivery failure |
+    /// | `Canceled` | Canceled by the service |
+    /// | `Unknown` | Unrecognised status string from ACS |
     ///
-    /// # Returns
+    /// Consider [`send_email_stream`] for a `Stream`-based alternative.
     ///
-    /// * `EmailResult<EmailSendStatusType>` - The result of the email status query, containing the status if successful.
+    /// # Errors
+    ///
+    /// - [`ACSError::Api`] — ACS returned an error (e.g. operation not found).
+    /// - [`ACSError::Network`] — request failed due to connectivity.
+    /// - [`ACSError::MissingField`] — the response was valid JSON but lacked a
+    ///   `status` field.
+    ///
+    /// [`send_email`]: ACSClient::send_email
+    /// [`send_email_stream`]: ACSClient::send_email_stream
     #[instrument(skip(self), fields(host = %self.host, api_version = %self.api_version.as_str()))]
     pub async fn get_email_status(&self, message_id: &str) -> EmailResult<EmailSendStatusType> {
-        acs_get_email_status(&self.http_client, &self.base_url, &self.auth_method, message_id, &self.api_version).await
+        acs_get_email_status(
+            &self.http_client,
+            &self.base_url,
+            &self.auth_method,
+            message_id,
+            &self.api_version,
+        )
+        .await
     }
 }
 
@@ -366,10 +531,7 @@ where
     } else {
         request_builder
     };
-    request_builder
-        .send()
-        .await
-        .map_err(network_err)
+    request_builder.send().await.map_err(network_err)
 }
 
 fn parse_url(url: &str) -> EmailResult<Url> {
@@ -378,8 +540,7 @@ fn parse_url(url: &str) -> EmailResult<Url> {
 
 fn serialize_body<T: serde::Serialize>(body: Option<&T>) -> EmailResult<String> {
     if let Some(body) = body {
-        serde_json::to_string(body)
-            .map_err(serial_err)
+        serde_json::to_string(body).map_err(serial_err)
     } else {
         Ok(String::new())
     }
@@ -398,7 +559,10 @@ fn wrap_http_client(client: &Client) -> Arc<dyn HttpClient> {
 /// # Returns
 ///
 /// * `Result<String, String>` - The result of the token acquisition, containing the token if successful.
-async fn get_access_token(http_client: &Client, auth_method: &ACSAuthMethod) -> Result<String, String> {
+async fn get_access_token(
+    http_client: &Client,
+    auth_method: &ACSAuthMethod,
+) -> Result<String, String> {
     match auth_method {
         ACSAuthMethod::ServicePrincipal {
             tenant_id,
@@ -419,7 +583,6 @@ async fn get_access_token(http_client: &Client, auth_method: &ACSAuthMethod) -> 
                 .get_token(&["https://communication.azure.com/.default"])
                 .await
                 .map_err(|e| format!("Failed to get access token: {}", e))?;
-
 
             return Ok(token.token.secret().to_owned());
         }
@@ -483,7 +646,6 @@ async fn create_headers(
             );
         }
     }
-
 
     Ok(headers)
 }
@@ -690,8 +852,15 @@ where
 
                 retries += 1;
 
-                let new_response =
-                    send_request(http_client, method.clone(), url, request_id, body, acs_auth_method).await?;
+                let new_response = send_request(
+                    http_client,
+                    method.clone(),
+                    url,
+                    request_id,
+                    body,
+                    acs_auth_method,
+                )
+                .await?;
                 response = new_response;
             }
             _ => {
@@ -715,10 +884,7 @@ async fn parse_response<T>(response: reqwest::Response) -> EmailResult<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    response
-        .json::<T>()
-        .await
-        .map_err(parse_err)
+    response.json::<T>().await.map_err(parse_err)
 }
 
 /// Parse the error response from the email send operation.
@@ -786,18 +952,26 @@ mod tests {
     #[test]
     fn builder_fails_without_auth_method() {
         let result = ACSClientBuilder::new().host("example.com").build();
-        assert!(result.err().unwrap().contains("Authentication method is required"));
+        assert!(result
+            .err()
+            .unwrap()
+            .contains("Authentication method is required"));
     }
 
     #[test]
     fn builder_succeeds_with_connection_string() {
         let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
-        assert!(ACSClientBuilder::new().connection_string(conn).build().is_ok());
+        assert!(ACSClientBuilder::new()
+            .connection_string(conn)
+            .build()
+            .is_ok());
     }
 
     #[test]
     fn builder_fails_with_invalid_connection_string() {
-        let result = ACSClientBuilder::new().connection_string("bad-string").build();
+        let result = ACSClientBuilder::new()
+            .connection_string("bad-string")
+            .build();
         assert!(result.is_err());
     }
 
@@ -822,7 +996,10 @@ mod tests {
     #[test]
     fn builder_default_api_version_is_v20230331() {
         let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
-        let client = ACSClientBuilder::new().connection_string(conn).build().unwrap();
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .build()
+            .unwrap();
         assert_eq!(client.api_version.as_str(), "2023-03-31");
     }
 
@@ -874,7 +1051,10 @@ mod tests {
 
     #[test]
     fn parse_err_produces_deserialization_variant() {
-        assert!(matches!(parse_err("bad json"), ACSError::Deserialization(_)));
+        assert!(matches!(
+            parse_err("bad json"),
+            ACSError::Deserialization(_)
+        ));
     }
 
     #[test]
@@ -901,12 +1081,18 @@ mod tests {
 
     #[test]
     fn create_missing_status_error_is_missing_field() {
-        assert!(matches!(create_missing_status_error(), ACSError::MissingField("status")));
+        assert!(matches!(
+            create_missing_status_error(),
+            ACSError::MissingField("status")
+        ));
     }
 
     #[test]
     fn create_missing_id_error_is_missing_field() {
-        assert!(matches!(create_missing_id_error(), ACSError::MissingField("id")));
+        assert!(matches!(
+            create_missing_id_error(),
+            ACSError::MissingField("id")
+        ));
     }
 
     // ── ACSError Display ──────────────────────────────────────────────────────
@@ -925,7 +1111,10 @@ mod tests {
 
     #[test]
     fn acs_error_display_api() {
-        let e = ACSError::Api { code: Some("400".to_string()), message: "bad request".to_string() };
+        let e = ACSError::Api {
+            code: Some("400".to_string()),
+            message: "bad request".to_string(),
+        };
         let s = e.to_string();
         assert!(s.contains("400"));
         assert!(s.contains("bad request"));
@@ -959,7 +1148,10 @@ mod tests {
     #[test]
     fn builder_default_max_retries_is_3() {
         let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
-        let client = ACSClientBuilder::new().connection_string(conn).build().unwrap();
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .build()
+            .unwrap();
         assert_eq!(client.max_retries, DEFAULT_MAX_RETRIES);
     }
 
@@ -1002,7 +1194,10 @@ mod tests {
     fn builder_default_timeout_builds_successfully() {
         // No timeout set — should still build fine
         let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
-        assert!(ACSClientBuilder::new().connection_string(conn).build().is_ok());
+        assert!(ACSClientBuilder::new()
+            .connection_string(conn)
+            .build()
+            .is_ok());
     }
 
     #[test]
@@ -1048,7 +1243,9 @@ mod tests {
 
     #[test]
     fn rate_limit_exceeded_display_mentions_retries() {
-        let err = ACSError::RateLimitExceeded { retries: DEFAULT_MAX_RETRIES };
+        let err = ACSError::RateLimitExceeded {
+            retries: DEFAULT_MAX_RETRIES,
+        };
         let s = err.to_string();
         assert!(s.contains("rate limit"));
         assert!(s.contains(&DEFAULT_MAX_RETRIES.to_string()));
@@ -1144,15 +1341,79 @@ mod integration_tests {
 
     // ── send_email ────────────────────────────────────────────────────────────
 
+    // ── API version routing ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_uses_v20230331_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .and(query_param("api-version", "2023-03-31"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "v1-msg" })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server); // uses default version
+        let result = client.send_email(&minimal_email()).await;
+        assert_eq!(result.unwrap(), "v1-msg");
+    }
+
+    #[tokio::test]
+    async fn send_email_uses_v20250901_when_configured() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .and(query_param("api-version", "2025-09-01"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "v2-msg" })))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .api_version(ACSApiVersion::V20250901)
+            .max_retries(0)
+            .base_url_override(&server.uri())
+            .build()
+            .unwrap();
+
+        let result = client.send_email(&minimal_email()).await;
+        assert_eq!(result.unwrap(), "v2-msg");
+    }
+
+    #[tokio::test]
+    async fn get_email_status_uses_v20250901_when_configured() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/op-v2"))
+            .and(query_param("api-version", "2025-09-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "op-v2",
+                "status": "Succeeded"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .api_version(ACSApiVersion::V20250901)
+            .max_retries(0)
+            .base_url_override(&server.uri())
+            .build()
+            .unwrap();
+
+        let result = client.get_email_status("op-v2").await;
+        assert!(matches!(result, Ok(EmailSendStatusType::Succeeded)));
+    }
+
+    // ── send_email (default version) ──────────────────────────────────────────
+
     #[tokio::test]
     async fn send_email_accepted_returns_message_id() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/emails:send"))
             .and(query_param("api-version", "2023-03-31"))
-            .respond_with(
-                ResponseTemplate::new(202).set_body_json(json!({ "id": "msg-001" })),
-            )
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "msg-001" })))
             .mount(&server)
             .await;
 
@@ -1191,9 +1452,7 @@ mod integration_tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/emails:send"))
-            .respond_with(
-                ResponseTemplate::new(202).set_body_json(json!({ "id": "msg-retry" })),
-            )
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "msg-retry" })))
             .mount(&server)
             .await;
 
@@ -1227,7 +1486,10 @@ mod integration_tests {
             .unwrap();
 
         let result = client.send_email(&minimal_email()).await;
-        assert!(matches!(result, Err(ACSError::RateLimitExceeded { retries: 2 })));
+        assert!(matches!(
+            result,
+            Err(ACSError::RateLimitExceeded { retries: 2 })
+        ));
     }
 
     // ── get_email_status ──────────────────────────────────────────────────────
@@ -1289,15 +1551,14 @@ mod integration_tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/emails:send"))
-            .respond_with(
-                ResponseTemplate::new(202).set_body_json(json!({ "id": "cb-msg" })),
-            )
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "cb-msg" })))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/emails/operations/cb-msg"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "id": "cb-msg", "status": "Succeeded" })),
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "id": "cb-msg", "status": "Succeeded" })),
             )
             .mount(&server)
             .await;
@@ -1322,9 +1583,18 @@ mod integration_tests {
 
         assert_eq!(message_id, "cb-msg");
         let calls = collected.lock().unwrap();
-        assert!(!calls.is_empty(), "callback should have been called at least once");
-        assert!(calls.iter().any(|(s, _)| s.contains("Succeeded")), "callback should report Succeeded");
-        assert!(calls.iter().all(|(_, has_err)| !has_err), "no error expected in callbacks");
+        assert!(
+            !calls.is_empty(),
+            "callback should have been called at least once"
+        );
+        assert!(
+            calls.iter().any(|(s, _)| s.contains("Succeeded")),
+            "callback should report Succeeded"
+        );
+        assert!(
+            calls.iter().all(|(_, has_err)| !has_err),
+            "no error expected in callbacks"
+        );
     }
 
     #[tokio::test]
@@ -1340,9 +1610,7 @@ mod integration_tests {
 
         let client = client_for(&server);
         let email = minimal_email();
-        let result = client
-            .send_email_with_callback(&email, |_, _, _| {})
-            .await;
+        let result = client.send_email_with_callback(&email, |_, _, _| {}).await;
 
         assert!(matches!(result, Err(ACSError::Api { .. })));
     }
@@ -1355,9 +1623,7 @@ mod integration_tests {
         // 202 but body is not valid JSON for SentEmailResponse
         Mock::given(method("POST"))
             .and(path("/emails:send"))
-            .respond_with(
-                ResponseTemplate::new(202).set_body_string("not json at all"),
-            )
+            .respond_with(ResponseTemplate::new(202).set_body_string("not json at all"))
             .mount(&server)
             .await;
 
@@ -1387,9 +1653,7 @@ mod integration_tests {
         // Second request → 202
         Mock::given(method("POST"))
             .and(path("/emails:send"))
-            .respond_with(
-                ResponseTemplate::new(202).set_body_json(json!({ "id": "after-retry" })),
-            )
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "after-retry" })))
             .mount(&server)
             .await;
 

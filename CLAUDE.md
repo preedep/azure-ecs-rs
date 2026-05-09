@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                                          # build
-cargo test                                           # run all 100 tests (unit + integration)
+cargo test                                           # run all 103 tests (unit + integration)
 cargo clippy -- -D warnings                          # lint (must pass clean for CI)
 cargo fmt --check                                    # format check (must pass clean for CI)
 cargo test <name>                                    # run a single test by name substring

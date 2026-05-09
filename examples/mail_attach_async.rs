@@ -14,7 +14,7 @@ use azure_ecs_rs::domain::entities::models::{
     EmailAddress, EmailAttachmentBuilder, EmailContent, Recipients, SentEmailBuilder,
 };
 use tracing::{error, info, instrument};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn get_env_var(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("env var {} not set", name))
@@ -23,7 +23,9 @@ fn get_env_var(name: &str) -> String {
 /// Builds an `EmailAttachment` from a file path using non-blocking I/O.
 /// MIME type is detected automatically; falls back to `application/octet-stream`.
 #[instrument]
-async fn load_attachment(file_path: &str) -> azure_ecs_rs::domain::entities::models::EmailAttachment {
+async fn load_attachment(
+    file_path: &str,
+) -> azure_ecs_rs::domain::entities::models::EmailAttachment {
     info!("Loading attachment");
     EmailAttachmentBuilder::new()
         .file_to_base64(file_path)

@@ -42,11 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("Failed to build ACSClient");
 
-    info!(
-        timeout_secs = 30,
-        max_retries = 5,
-        "Client configured"
-    );
+    info!(timeout_secs = 30, max_retries = 5, "Client configured");
 
     let email = SentEmailBuilder::new()
         .sender(sender)

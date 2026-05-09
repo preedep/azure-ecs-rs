@@ -1,11 +1,24 @@
+//! Shared-key (HMAC-SHA256) request signing for the ACS data-plane API.
+//!
+//! The ACS shared-key authentication scheme works as follows:
+//!
+//! 1. Hash the request body with SHA-256 and base64-encode the digest
+//!    (`x-ms-content-sha256` header).
+//! 2. Build a canonical signing string from the HTTP method, path+query,
+//!    date, host, and content hash.
+//! 3. Sign the string with HMAC-SHA256 using the base64-decoded access key.
+//! 4. Attach the signature in an `Authorization: HMAC-SHA256 …` header.
+//!
+//! All signing happens synchronously in the calling thread; no I/O is performed.
+
 use crate::domain::entities::models::EndPointParams;
 use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};
 use httpdate::fmt_http_date;
-use tracing::debug;
 use reqwest::header::HeaderMap;
 use sha2::{Digest, Sha256};
 use std::time::SystemTime;
+use tracing::debug;
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;

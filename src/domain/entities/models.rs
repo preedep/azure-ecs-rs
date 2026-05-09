@@ -1,3 +1,21 @@
+//! Domain model — all data types, builders, and the `ACSError` error enum.
+//!
+//! # Key types
+//!
+//! | Type | Role |
+//! |---|---|
+//! | [`ACSError`] | Typed error returned by every public `ACSClient` method |
+//! | [`SentEmail`] / [`SentEmailBuilder`] | Top-level email payload |
+//! | [`EmailAttachment`] / [`EmailAttachmentBuilder`] | File attachment with sync and async build paths |
+//! | [`EmailSendStatusType`] | Delivery status enum (`NotStarted`, `Running`, `Succeeded`, …) |
+//! | [`HeaderSet`] | Custom email headers; serialises as a flat `{"name": "value"}` JSON map |
+//!
+//! # Builder pattern
+//!
+//! All three builders implement [`Default`] and delegate to `new()`.  Use
+//! [`SentEmailBuilder`] to construct a validated [`SentEmail`]; build returns
+//! `Err(ACSError::MissingField)` if required fields are absent.
+
 use base64::engine::general_purpose;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -6,8 +24,8 @@ use std::fmt::Formatter;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::str::FromStr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 /// Typed error returned by all public `ACSClient` methods.
 #[derive(Debug, thiserror::Error)]
@@ -57,7 +75,9 @@ impl From<ErrorResponse> for ACSError {
         let detail = e.error.unwrap_or_default();
         ACSError::Api {
             code: detail.code,
-            message: detail.message.unwrap_or_else(|| "unknown error".to_string()),
+            message: detail
+                .message
+                .unwrap_or_else(|| "unknown error".to_string()),
         }
     }
 }
@@ -622,8 +642,15 @@ impl Serialize for HeaderSet {
         S: serde::Serializer,
     {
         let mut headers_map = std::collections::BTreeMap::new();
-        for header in self.0.iter().filter(|header| header.name.is_some() && header.value.is_some()) {
-            headers_map.insert(header.name.as_ref().unwrap(), header.value.as_ref().unwrap());
+        for header in self
+            .0
+            .iter()
+            .filter(|header| header.name.is_some() && header.value.is_some())
+        {
+            headers_map.insert(
+                header.name.as_ref().unwrap(),
+                header.value.as_ref().unwrap(),
+            );
         }
         headers_map.serialize(serializer)
     }
@@ -649,11 +676,10 @@ impl<'de> serde::Deserialize<'de> for HeaderSet {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sent_email_builder_with_missing_content() {
@@ -805,7 +831,11 @@ mod tests {
                 plain_text: None,
                 html: None,
             })
-            .recipients(Recipients { to: None, cc: None, b_cc: None })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
             .build();
         assert!(result.is_err());
     }
@@ -814,8 +844,16 @@ mod tests {
     fn sent_email_builder_optional_fields_default_to_none() {
         let email = SentEmailBuilder::new()
             .sender("s@example.com".to_string())
-            .content(EmailContent { subject: None, plain_text: None, html: None })
-            .recipients(Recipients { to: None, cc: None, b_cc: None })
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
             .build()
             .unwrap();
         assert!(email.headers.is_none());
@@ -828,8 +866,16 @@ mod tests {
     fn sent_email_builder_with_all_optional_fields() {
         let email = SentEmailBuilder::new()
             .sender("s@example.com".to_string())
-            .content(EmailContent { subject: None, plain_text: None, html: None })
-            .recipients(Recipients { to: None, cc: None, b_cc: None })
+            .content(EmailContent {
+                subject: None,
+                plain_text: None,
+                html: None,
+            })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
             .headers(vec![Header {
                 name: Some("X-Custom".to_string()),
                 value: Some("val".to_string()),
@@ -874,12 +920,30 @@ mod tests {
     #[test]
     fn email_send_status_type_from_str_all_variants() {
         use std::str::FromStr;
-        assert_eq!(EmailSendStatusType::from_str("Canceled").unwrap(), EmailSendStatusType::Canceled);
-        assert_eq!(EmailSendStatusType::from_str("Failed").unwrap(), EmailSendStatusType::Failed);
-        assert_eq!(EmailSendStatusType::from_str("NotStarted").unwrap(), EmailSendStatusType::NotStarted);
-        assert_eq!(EmailSendStatusType::from_str("Running").unwrap(), EmailSendStatusType::Running);
-        assert_eq!(EmailSendStatusType::from_str("Succeeded").unwrap(), EmailSendStatusType::Succeeded);
-        assert_eq!(EmailSendStatusType::from_str("anything-else").unwrap(), EmailSendStatusType::Unknown);
+        assert_eq!(
+            EmailSendStatusType::from_str("Canceled").unwrap(),
+            EmailSendStatusType::Canceled
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("Failed").unwrap(),
+            EmailSendStatusType::Failed
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("NotStarted").unwrap(),
+            EmailSendStatusType::NotStarted
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("Running").unwrap(),
+            EmailSendStatusType::Running
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("Succeeded").unwrap(),
+            EmailSendStatusType::Succeeded
+        );
+        assert_eq!(
+            EmailSendStatusType::from_str("anything-else").unwrap(),
+            EmailSendStatusType::Unknown
+        );
     }
 
     #[test]
@@ -915,10 +979,20 @@ mod tests {
                 plain_text: None,
                 html: None,
             })
-            .recipients(Recipients { to: None, cc: None, b_cc: None })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
             .headers(vec![
-                Header { name: Some("X-Foo".to_string()), value: Some("bar".to_string()) },
-                Header { name: Some("X-Baz".to_string()), value: Some("qux".to_string()) },
+                Header {
+                    name: Some("X-Foo".to_string()),
+                    value: Some("bar".to_string()),
+                },
+                Header {
+                    name: Some("X-Baz".to_string()),
+                    value: Some("qux".to_string()),
+                },
             ])
             .build()
             .unwrap();
@@ -933,9 +1007,18 @@ mod tests {
     #[test]
     fn header_set_skips_headers_with_none_name_or_value() {
         let header_set = HeaderSet(vec![
-            Header { name: None, value: Some("v".to_string()) },
-            Header { name: Some("k".to_string()), value: None },
-            Header { name: Some("Keep".to_string()), value: Some("yes".to_string()) },
+            Header {
+                name: None,
+                value: Some("v".to_string()),
+            },
+            Header {
+                name: Some("k".to_string()),
+                value: None,
+            },
+            Header {
+                name: Some("Keep".to_string()),
+                value: Some("yes".to_string()),
+            },
         ]);
         let serialized = serde_json::to_value(&header_set).unwrap();
         assert_eq!(serialized.as_object().unwrap().len(), 1);
@@ -953,13 +1036,23 @@ mod tests {
                 plain_text: None,
                 html: None,
             })
-            .recipients(Recipients { to: None, cc: None, b_cc: None })
+            .recipients(Recipients {
+                to: None,
+                cc: None,
+                b_cc: None,
+            })
             .build()
             .unwrap();
         let json = serde_json::to_value(&email).unwrap();
         assert_eq!(json["senderAddress"], "s@example.com");
-        assert!(json.get("headers").is_none(), "optional headers should be omitted");
-        assert!(json.get("attachments").is_none(), "optional attachments should be omitted");
+        assert!(
+            json.get("headers").is_none(),
+            "optional headers should be omitted"
+        );
+        assert!(
+            json.get("attachments").is_none(),
+            "optional attachments should be omitted"
+        );
     }
 
     // ── Phase 3b: build_async ─────────────────────────────────────────────────
