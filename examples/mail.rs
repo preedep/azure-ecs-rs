@@ -115,7 +115,6 @@ async fn send_email_with_api(
             debug!("host_name: {}", host_name);
             debug!("tenant_id: {}", tenant_id);
             debug!("client_id: {}", client_id);
-            debug!("client_secret: {}", client_secret);
             ACSClientBuilder::new()
                 .host(host_name.as_str())
                 .service_principal(
