@@ -439,6 +439,23 @@ impl ACSClient {
     /// - [`ACSError::Api`] — ACS returned a non-202 error response.
     /// - [`ACSError::RateLimitExceeded`] — all retries exhausted on `429`/`503`.
     ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use azure_ecs_rs::adapters::gateways::acs_email::ACSClientBuilder;
+    /// use azure_ecs_rs::domain::entities::models::ACSError;
+    ///
+    /// let client = ACSClientBuilder::new()
+    ///     .connection_string(&connection_str)
+    ///     .build()?;
+    ///
+    /// match client.send_email(&email).await {
+    ///     Ok(id)                                   => println!("queued: {id}"),
+    ///     Err(ACSError::RateLimitExceeded { retries }) => eprintln!("rate limited after {retries} retries"),
+    ///     Err(e)                                   => eprintln!("error: {e}"),
+    /// }
+    /// ```
+    ///
     /// [`get_email_status`]: ACSClient::get_email_status
     /// [`send_email_stream`]: ACSClient::send_email_stream
     /// [`send_email_with_callback`]: ACSClient::send_email_with_callback
@@ -472,6 +489,19 @@ impl ACSClient {
     ///
     /// Same variants as [`send_email`].
     ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use uuid::Uuid;
+    ///
+    /// // Generate the key once; persist it so you can reuse it on retry.
+    /// let key = Uuid::new_v4().to_string();
+    ///
+    /// // Safe to call multiple times — ACS deduplicates on the same key.
+    /// let id = client.send_email_idempotent(&email, &key).await?;
+    /// println!("queued: {id}");
+    /// ```
+    ///
     /// [`send_email`]: ACSClient::send_email
     #[instrument(skip(self, email), fields(host = %self.host, api_version = %self.api_version.as_str()))]
     pub async fn send_email_idempotent(
@@ -496,7 +526,7 @@ impl ACSClient {
     /// Submit an email and receive delivery status updates via a callback.
     ///
     /// Sends the email, then spawns a Tokio task that polls
-    /// [`get_email_status`] every **5 seconds** and invokes `call_back` on each
+    /// [`get_email_status`] every [`poll_interval`] and invokes `call_back` on each
     /// update.  The task stops when a terminal status
     /// (`Succeeded`, `Failed`, `Canceled`, `Unknown`) or a poll error is
     /// observed.
@@ -521,7 +551,26 @@ impl ACSClient {
     /// Returns `Err` only if the initial *send* fails.  Poll errors are
     /// delivered through the callback rather than propagated.
     ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use azure_ecs_rs::domain::entities::models::EmailSendStatusType;
+    ///
+    /// let (id, done_rx) = client
+    ///     .send_email_with_callback(&email, |id, status, err| {
+    ///         if let Some(e) = err {
+    ///             eprintln!("id={id} poll error={e}");
+    ///         } else {
+    ///             println!("id={id} status={status}");
+    ///         }
+    ///     })
+    ///     .await?;
+    ///
+    /// let _ = done_rx.await; // block until terminal status or poll error
+    /// ```
+    ///
     /// [`get_email_status`]: ACSClient::get_email_status
+    /// [`poll_interval`]: ACSClientBuilder::poll_interval
     #[allow(dead_code)]
     #[instrument(skip(self, email, call_back), fields(host = %self.host, api_version = %self.api_version.as_str()))]
     pub async fn send_email_with_callback<F>(
@@ -581,7 +630,7 @@ impl ACSClient {
     /// Stream delivery status updates for a sent email.
     ///
     /// Sends the email, then returns a `Stream` that yields one
-    /// `Result<EmailSendStatusType, ACSError>` per poll interval (5 s).
+    /// `Result<EmailSendStatusType, ACSError>` per [`poll_interval`].
     /// The stream ends after the first terminal status
     /// (`Succeeded`, `Failed`, `Canceled`, `Unknown`) or on a poll error.
     ///
@@ -589,10 +638,22 @@ impl ACSClient {
     ///
     /// ```rust,ignore
     /// use futures::StreamExt;
+    /// use azure_ecs_rs::domain::entities::models::EmailSendStatusType;
+    ///
     /// let (id, stream) = client.send_email_stream(&email).await?;
     /// tokio::pin!(stream);
-    /// while let Some(item) = stream.next().await { /* … */ }
+    ///
+    /// while let Some(item) = stream.next().await {
+    ///     match item {
+    ///         Ok(EmailSendStatusType::Succeeded) => { println!("delivered!"); break; }
+    ///         Ok(EmailSendStatusType::Failed)    => { eprintln!("delivery failed"); break; }
+    ///         Ok(status)                         => println!("status: {status}"),
+    ///         Err(e)                             => { eprintln!("poll error: {e}"); break; }
+    ///     }
+    /// }
     /// ```
+    ///
+    /// [`poll_interval`]: ACSClientBuilder::poll_interval
     #[instrument(skip(self, email), fields(host = %self.host, api_version = %self.api_version.as_str()))]
     pub async fn send_email_stream(
         &self,
@@ -648,6 +709,20 @@ impl ACSClient {
     ///
     /// Each element follows the same error variants as [`send_email`].
     ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let emails = vec![email1, email2, email3];
+    /// let results = client.send_emails_batch(&emails).await;
+    ///
+    /// for (i, result) in results.iter().enumerate() {
+    ///     match result {
+    ///         Ok(id) => println!("[{i}] queued: {id}"),
+    ///         Err(e) => eprintln!("[{i}] failed: {e}"),
+    ///     }
+    /// }
+    /// ```
+    ///
     /// [`send_email`]: ACSClient::send_email
     #[instrument(skip(self, emails), fields(host = %self.host, count = emails.len()))]
     pub async fn send_emails_batch(&self, emails: &[SentEmail]) -> Vec<EmailResult<String>> {
@@ -663,7 +738,23 @@ impl ACSClient {
     /// # Errors
     ///
     /// - [`ACSError::Timeout`] — no terminal status observed within `timeout`.
+    ///   The email may still be in transit — ACS continues processing it.
     /// - All errors from [`send_email`] and [`get_email_status`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    /// use azure_ecs_rs::domain::entities::models::{ACSError, EmailSendStatusType};
+    ///
+    /// match client.send_email_and_wait(&email, Duration::from_secs(60)).await {
+    ///     Ok(EmailSendStatusType::Succeeded) => println!("delivered"),
+    ///     Ok(EmailSendStatusType::Failed)    => eprintln!("delivery failed"),
+    ///     Ok(status)                         => println!("terminal: {status}"),
+    ///     Err(ACSError::Timeout)             => eprintln!("timed out — email may still be in transit"),
+    ///     Err(e)                             => eprintln!("error: {e}"),
+    /// }
+    /// ```
     ///
     /// [`send_email`]: ACSClient::send_email
     /// [`get_email_status`]: ACSClient::get_email_status
@@ -696,11 +787,38 @@ impl ACSClient {
     /// without issuing another status poll.  If the deadline elapses first,
     /// [`ACSError::Timeout`] is returned instead.
     ///
+    /// Cancellation only stops the local wait — the email remains queued in ACS
+    /// and may still be delivered.
+    ///
     /// # Errors
     ///
     /// - [`ACSError::Canceled`] — `token` was cancelled before terminal status.
     /// - [`ACSError::Timeout`] — `timeout` elapsed before terminal status.
     /// - All errors from [`send_email`] and [`get_email_status`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    /// use tokio_util::sync::CancellationToken;
+    /// use azure_ecs_rs::domain::entities::models::{ACSError, EmailSendStatusType};
+    ///
+    /// let token = CancellationToken::new();
+    ///
+    /// // Cancel from a shutdown handler, request context, or test harness:
+    /// // token.cancel();
+    ///
+    /// match client
+    ///     .send_email_and_wait_cancellable(&email, Duration::from_secs(60), token)
+    ///     .await
+    /// {
+    ///     Ok(EmailSendStatusType::Succeeded) => println!("delivered"),
+    ///     Ok(status)                         => println!("terminal: {status}"),
+    ///     Err(ACSError::Canceled)            => eprintln!("cancelled — email may still deliver"),
+    ///     Err(ACSError::Timeout)             => eprintln!("timed out — email may still deliver"),
+    ///     Err(e)                             => eprintln!("error: {e}"),
+    /// }
+    /// ```
     ///
     /// [`send_email_and_wait`]: ACSClient::send_email_and_wait
     /// [`send_email`]: ACSClient::send_email
@@ -815,6 +933,31 @@ impl ACSClient {
     /// Returns `Err` only if the initial *send* fails.  Poll errors and
     /// cancellation are both delivered via `done_rx` resolving.
     ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let token = CancellationToken::new();
+    ///
+    /// let (id, done_rx) = client
+    ///     .send_email_with_callback_cancellable(
+    ///         &email,
+    ///         token.clone(),
+    ///         |id, status, err| {
+    ///             if let Some(e) = err {
+    ///                 eprintln!("id={id} poll error={e}");
+    ///             } else {
+    ///                 println!("id={id} status={status}");
+    ///             }
+    ///         },
+    ///     )
+    ///     .await?;
+    ///
+    /// // token.cancel() stops the background task early.
+    /// let _ = done_rx.await; // resolves on terminal status or cancellation
+    /// ```
+    ///
     /// [`send_email_with_callback`]: ACSClient::send_email_with_callback
     #[allow(dead_code)]
     #[instrument(skip(self, email, token, call_back), fields(host = %self.host, api_version = %self.api_version.as_str()))]
@@ -889,7 +1032,7 @@ impl ACSClient {
     /// | `Canceled` | Canceled by the service |
     /// | `Unknown` | Unrecognised status string from ACS |
     ///
-    /// Consider [`send_email_stream`] for a `Stream`-based alternative.
+    /// Consider [`send_email_stream`] or [`send_email_and_wait`] for higher-level alternatives.
     ///
     /// # Errors
     ///
@@ -898,8 +1041,29 @@ impl ACSClient {
     /// - [`ACSError::MissingField`] — the response was valid JSON but lacked a
     ///   `status` field.
     ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    /// use azure_ecs_rs::domain::entities::models::EmailSendStatusType;
+    ///
+    /// let id = client.send_email(&email).await?;
+    ///
+    /// loop {
+    ///     tokio::time::sleep(Duration::from_secs(5)).await;
+    ///     match client.get_email_status(&id).await? {
+    ///         EmailSendStatusType::Succeeded => { println!("delivered"); break; }
+    ///         EmailSendStatusType::Failed    => { eprintln!("failed"); break; }
+    ///         EmailSendStatusType::Canceled
+    ///         | EmailSendStatusType::Unknown  => { eprintln!("terminal"); break; }
+    ///         status                          => println!("status: {status}"),
+    ///     }
+    /// }
+    /// ```
+    ///
     /// [`send_email`]: ACSClient::send_email
     /// [`send_email_stream`]: ACSClient::send_email_stream
+    /// [`send_email_and_wait`]: ACSClient::send_email_and_wait
     #[instrument(skip(self), fields(host = %self.host, api_version = %self.api_version.as_str()))]
     pub async fn get_email_status(&self, message_id: &str) -> EmailResult<EmailSendStatusType> {
         acs_get_email_status(
