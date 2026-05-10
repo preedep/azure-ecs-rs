@@ -5,7 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.3.0] — unreleased
+## [0.4.0] — unreleased
+
+### Added
+
+- **Configurable poll interval** — `.poll_interval(Duration)` on `ACSClientBuilder` controls the delay between status polls in `send_email_and_wait*`, `send_email_stream*`, and the callback variants. Default: 5 s (same as the previous hardcoded value — no behaviour change for existing callers).
+- **`send_email_and_wait`** — `ACSClient::send_email_and_wait(email, timeout: Duration) -> Result<EmailSendStatusType, ACSError>` sends an email and blocks until a terminal status is observed or the deadline elapses. Returns `ACSError::Timeout` when the deadline expires; the email may still be delivered.
+- **`send_email_and_wait_cancellable`** — identical to `send_email_and_wait` but accepts a `CancellationToken`; returns `ACSError::Canceled` when the token is cancelled before a terminal status is observed. Cancellation only stops the local wait — the email remains queued in ACS.
+- **`send_email_idempotent`** — `ACSClient::send_email_idempotent(email, idempotency_key: &str)` sets `repeatability-request-id` and `repeatability-first-sent` headers on the initial request and all retries, making application-level retries safe against double-sends.
+- **`ACSError::Timeout`** — returned by `send_email_and_wait` and `send_email_and_wait_cancellable` when the deadline elapses before a terminal status.
+- **`ACSError::Canceled`** — returned by `send_email_and_wait_cancellable` when the `CancellationToken` is cancelled before a terminal status.
+- **`examples/mail_wait.rs`** — demonstrates `send_email_and_wait` and `send_email_and_wait_cancellable` with a simulated shutdown abort.
+
+### Security
+
+- **Access key no longer logged** — `acs_shared_key::parse_endpoint` previously emitted the raw Shared Key (HMAC secret) at `debug!` level. The log line has been removed.
+- **OAuth client secret no longer logged** — `examples/mail.rs` previously emitted the Service Principal `client_secret` at `debug!` level. The log line has been removed.
+
+### Documentation
+
+- **README** — new "Choosing a Send Method" section with a decision table and flowchart to help callers pick the right API; added code examples for `send_email_and_wait` and `send_email_and_wait_cancellable`; updated examples table.
+- **Rust doc comments** — all public `ACSClientBuilder` methods (`new`, `api_version`, `host`, `connection_string`, `service_principal`, `managed_identity`, `build`) upgraded from `//` inline comments to `///` doc comments, now visible on docs.rs. Private helper functions simplified from verbose `# Arguments` / `# Returns` blocks to concise summaries.
+- **CLAUDE.md** — full public API list, all error variants, complete integration test table, `poll_interval` builder option documented.
+
+### Tests
+
+136 → 157 (+21 unit + integration tests covering `poll_interval` builder propagation, clone preservation, all `send_email_and_wait*` and `send_email_idempotent` paths including timeout, cancellation, send failure, poll error, and idempotency header presence on retries).
+
+---
+
+## [0.3.0] — 2026-05-10
 
 ### Added
 
