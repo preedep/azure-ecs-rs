@@ -68,6 +68,12 @@ pub enum ACSError {
     /// Rate limit hit and all retries were exhausted.
     #[error("rate limit exceeded after {retries} retries")]
     RateLimitExceeded { retries: u32 },
+
+    /// [`send_email_and_wait`] did not observe a terminal status within the given timeout.
+    ///
+    /// [`send_email_and_wait`]: crate::adapters::gateways::acs_email::ACSClient::send_email_and_wait
+    #[error("timed out waiting for terminal delivery status")]
+    Timeout,
 }
 
 impl From<ErrorResponse> for ACSError {

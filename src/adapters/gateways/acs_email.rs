@@ -6,7 +6,8 @@
 //!   the shared [`reqwest::Client`] once so all requests reuse the same connection pool.
 //! - [`ACSClient`] — clone-cheap handle (all fields behind `Arc` or `Clone`).
 //!   Owns the HTTP client and dispatches the public operations:
-//!   [`send_email`], [`send_emails_batch`], [`send_email_with_callback`],
+//!   [`send_email`], [`send_email_idempotent`], [`send_email_and_wait`],
+//!   [`send_emails_batch`], [`send_email_with_callback`],
 //!   [`send_email_with_callback_cancellable`], [`send_email_stream`],
 //!   [`send_email_stream_cancellable`], and [`get_email_status`].
 //!
@@ -56,6 +57,8 @@
 //! each request; responses are not cached.
 //!
 //! [`send_email`]: ACSClient::send_email
+//! [`send_email_idempotent`]: ACSClient::send_email_idempotent
+//! [`send_email_and_wait`]: ACSClient::send_email_and_wait
 //! [`send_emails_batch`]: ACSClient::send_emails_batch
 //! [`send_email_with_callback`]: ACSClient::send_email_with_callback
 //! [`send_email_with_callback_cancellable`]: ACSClient::send_email_with_callback_cancellable
@@ -137,6 +140,9 @@ enum ACSAuthMethod {
 /// Default number of retries for `429 Too Many Requests` and `503 Service Unavailable` responses.
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
+/// Default interval between status-poll requests.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Async HTTP client for the ACS Email data-plane API.
 ///
 /// Construct via [`ACSClientBuilder`].  The client is cheap to clone — the
@@ -178,6 +184,7 @@ pub struct ACSClient {
     api_version: ACSApiVersion,
     http_client: Client,
     max_retries: u32,
+    poll_interval: Duration,
 }
 
 /// Fluent builder for [`ACSClient`].
@@ -201,6 +208,7 @@ pub struct ACSClientBuilder {
     api_version: ACSApiVersion,
     max_retries: u32,
     timeout: Option<Duration>,
+    poll_interval: Duration,
     base_url_override: Option<String>,
 }
 
@@ -220,6 +228,7 @@ impl ACSClientBuilder {
             api_version: ACSApiVersion::default(),
             max_retries: DEFAULT_MAX_RETRIES,
             timeout: None,
+            poll_interval: DEFAULT_POLL_INTERVAL,
             base_url_override: None,
         }
     }
@@ -253,6 +262,16 @@ impl ACSClientBuilder {
     /// [`ACSError::Network`]. Default: no timeout.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Interval between status-poll requests used by [`send_email_stream`],
+    /// [`send_email_and_wait`], and the callback variants. Default: 5 s.
+    ///
+    /// [`send_email_stream`]: ACSClient::send_email_stream
+    /// [`send_email_and_wait`]: ACSClient::send_email_and_wait
+    pub fn poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
         self
     }
 
@@ -314,6 +333,7 @@ impl ACSClientBuilder {
                 api_version: self.api_version,
                 http_client,
                 max_retries: self.max_retries,
+                poll_interval: self.poll_interval,
             });
         }
 
@@ -334,6 +354,7 @@ impl ACSClientBuilder {
             api_version: self.api_version,
             http_client,
             max_retries: self.max_retries,
+            poll_interval: self.poll_interval,
         })
     }
 }
@@ -369,6 +390,42 @@ impl ACSClient {
             email,
             &self.api_version,
             self.max_retries,
+            None,
+        )
+        .await
+    }
+
+    /// Submit an email with a caller-supplied idempotency key.
+    ///
+    /// Behaves like [`send_email`] but sets `repeatability-request-id` and
+    /// `repeatability-first-sent` headers on every attempt (including retries).
+    /// ACS deduplicates requests that share the same key within a short window,
+    /// making application-level retries safe against double-sends.
+    ///
+    /// `idempotency_key` must be a valid UUID string (e.g. `Uuid::new_v4().to_string()`).
+    /// Do not reuse the same key for a different email payload.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`send_email`].
+    ///
+    /// [`send_email`]: ACSClient::send_email
+    #[instrument(skip(self, email), fields(host = %self.host, api_version = %self.api_version.as_str()))]
+    pub async fn send_email_idempotent(
+        &self,
+        email: &SentEmail,
+        idempotency_key: &str,
+    ) -> EmailResult<String> {
+        let request_id = Uuid::new_v4().to_string();
+        acs_send_email(
+            &self.http_client,
+            &self.base_url,
+            &self.auth_method,
+            &request_id,
+            email,
+            &self.api_version,
+            self.max_retries,
+            Some(idempotency_key),
         )
         .await
     }
@@ -421,6 +478,7 @@ impl ACSClient {
             email,
             &self.api_version,
             self.max_retries,
+            None,
         )
         .await?;
 
@@ -428,7 +486,7 @@ impl ACSClient {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             loop {
-                sleep(Duration::from_secs(5)).await;
+                sleep(self.poll_interval).await;
                 let resp_status = self.get_email_status(&message_id).await;
                 if let Ok(status) = resp_status {
                     call_back(message_id.clone(), &status, None);
@@ -489,13 +547,14 @@ impl ACSClient {
             email,
             &self.api_version,
             self.max_retries,
+            None,
         )
         .await?;
 
         let returned_id = message_id.clone();
         let poll_stream = stream! {
             loop {
-                sleep(Duration::from_secs(5)).await;
+                sleep(self.poll_interval).await;
                 match self.get_email_status(&message_id).await {
                     Ok(status) => {
                         let terminal = is_terminal_status(&status);
@@ -530,6 +589,40 @@ impl ACSClient {
     #[instrument(skip(self, emails), fields(host = %self.host, count = emails.len()))]
     pub async fn send_emails_batch(&self, emails: &[SentEmail]) -> Vec<EmailResult<String>> {
         futures::future::join_all(emails.iter().map(|e| self.send_email(e))).await
+    }
+
+    /// Send an email and block until a terminal delivery status is observed or `timeout` elapses.
+    ///
+    /// Sends the email via [`send_email`], then polls [`get_email_status`] every
+    /// [`poll_interval`] until `Succeeded`, `Failed`, `Canceled`, or `Unknown` is
+    /// returned, or until `timeout` has elapsed.
+    ///
+    /// # Errors
+    ///
+    /// - [`ACSError::Timeout`] — no terminal status observed within `timeout`.
+    /// - All errors from [`send_email`] and [`get_email_status`].
+    ///
+    /// [`send_email`]: ACSClient::send_email
+    /// [`get_email_status`]: ACSClient::get_email_status
+    /// [`poll_interval`]: ACSClientBuilder::poll_interval
+    #[instrument(skip(self, email), fields(host = %self.host, api_version = %self.api_version.as_str()))]
+    pub async fn send_email_and_wait(
+        &self,
+        email: &SentEmail,
+        timeout: Duration,
+    ) -> EmailResult<EmailSendStatusType> {
+        let operation_id = self.send_email(email).await?;
+        tokio::time::timeout(timeout, async {
+            loop {
+                sleep(self.poll_interval).await;
+                let status = self.get_email_status(&operation_id).await?;
+                if is_terminal_status(&status) {
+                    return Ok(status);
+                }
+            }
+        })
+        .await
+        .map_err(|_| ACSError::Timeout)?
     }
 
     /// Stream delivery status updates with cooperative cancellation.
@@ -574,6 +667,7 @@ impl ACSClient {
             email,
             &self.api_version,
             self.max_retries,
+            None,
         )
         .await?;
 
@@ -582,7 +676,7 @@ impl ACSClient {
             loop {
                 tokio::select! {
                     _ = token.cancelled() => { break; }
-                    _ = sleep(Duration::from_secs(5)) => {
+                    _ = sleep(self.poll_interval) => {
                         match self.get_email_status(&message_id).await {
                             Ok(status) => {
                                 let terminal = is_terminal_status(&status);
@@ -634,6 +728,7 @@ impl ACSClient {
             email,
             &self.api_version,
             self.max_retries,
+            None,
         )
         .await?;
 
@@ -646,7 +741,7 @@ impl ACSClient {
                         let _ = tx.send(());
                         break;
                     }
-                    _ = sleep(Duration::from_secs(5)) => {
+                    _ = sleep(self.poll_interval) => {
                         let resp_status = self.get_email_status(&message_id).await;
                         if let Ok(status) = resp_status {
                             call_back(message_id.clone(), &status, None);
@@ -710,7 +805,7 @@ impl ACSClient {
     }
 }
 
-#[instrument(skip(http_client, body, acs_auth_method), fields(method = %method, url = %url))]
+#[instrument(skip(http_client, body, acs_auth_method, extra_headers), fields(method = %method, url = %url))]
 async fn send_request<T>(
     http_client: &Client,
     method: reqwest::Method,
@@ -718,13 +813,14 @@ async fn send_request<T>(
     request_id: &str,
     body: Option<&T>,
     acs_auth_method: &ACSAuthMethod,
+    extra_headers: Option<&reqwest::header::HeaderMap>,
 ) -> EmailResult<reqwest::Response>
 where
     T: serde::Serialize,
 {
     let url_endpoint = parse_url(url)?;
     let json_body = serialize_body(body)?;
-    let headers = create_headers(
+    let mut headers = create_headers(
         http_client,
         &url_endpoint,
         method.as_str(),
@@ -733,6 +829,11 @@ where
         acs_auth_method,
     )
     .await?;
+    if let Some(extra) = extra_headers {
+        for (key, value) in extra.iter() {
+            headers.insert(key.clone(), value.clone());
+        }
+    }
     let request_builder = http_client.request(method, url).headers(headers);
     let request_builder = if let Some(body) = body {
         request_builder.json(body)
@@ -926,6 +1027,7 @@ async fn acs_get_email_status(
         request_id,
         None,
         acs_auth_method,
+        None,
     )
     .await?;
     if response.status() == StatusCode::OK {
@@ -940,6 +1042,24 @@ async fn acs_get_email_status(
     }
 }
 
+fn build_repeatability_headers(
+    idempotency_key: Option<&str>,
+) -> Option<reqwest::header::HeaderMap> {
+    let key = idempotency_key?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static("repeatability-request-id"),
+        key.parse().unwrap(),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("repeatability-first-sent"),
+        httpdate::fmt_http_date(std::time::SystemTime::now())
+            .parse()
+            .unwrap(),
+    );
+    Some(headers)
+}
+
 /// Send an email using the ACS client.
 ///
 /// # Arguments
@@ -952,7 +1072,8 @@ async fn acs_get_email_status(
 /// # Returns
 ///
 /// * `EmailResult<String>` - The result of the email send operation, containing the message ID if successful.
-#[instrument(skip(http_client, acs_auth_method, email), fields(base_url = %base_url, max_retries = %max_retries))]
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(http_client, acs_auth_method, email, idempotency_key), fields(base_url = %base_url, max_retries = %max_retries))]
 async fn acs_send_email(
     http_client: &Client,
     base_url: &str,
@@ -961,6 +1082,7 @@ async fn acs_send_email(
     email: &SentEmail,
     api_version: &ACSApiVersion,
     max_retries: u32,
+    idempotency_key: Option<&str>,
 ) -> EmailResult<String> {
     let url = format!(
         "{}/emails:send?api-version={}",
@@ -968,6 +1090,7 @@ async fn acs_send_email(
         api_version.as_str()
     );
     debug!("end point URL: {}", url);
+    let extra_headers = build_repeatability_headers(idempotency_key);
     let response = send_request(
         http_client,
         reqwest::Method::POST,
@@ -975,6 +1098,7 @@ async fn acs_send_email(
         request_id,
         Some(email),
         acs_auth_method,
+        extra_headers.as_ref(),
     )
     .await?;
     debug!("{:#?}", response);
@@ -987,6 +1111,7 @@ async fn acs_send_email(
         Some(email),
         acs_auth_method,
         max_retries,
+        extra_headers.as_ref(),
     )
     .await
 }
@@ -1015,6 +1140,7 @@ async fn handle_response_and_retry_if_needed<T>(
     body: Option<&T>,
     acs_auth_method: &ACSAuthMethod,
     max_retries: u32,
+    extra_headers: Option<&reqwest::header::HeaderMap>,
 ) -> EmailResult<String>
 where
     T: serde::Serialize,
@@ -1067,6 +1193,7 @@ where
                     request_id,
                     body,
                     acs_auth_method,
+                    extra_headers,
                 )
                 .await?;
                 response = new_response;
@@ -1329,6 +1456,13 @@ mod tests {
     }
 
     #[test]
+    fn acs_error_display_timeout() {
+        let e = ACSError::Timeout;
+        let s = e.to_string();
+        assert!(s.contains("timed out"));
+    }
+
+    #[test]
     fn acs_error_from_error_response() {
         let resp = ErrorResponse {
             error: Some(crate::domain::entities::models::ErrorDetail {
@@ -1577,6 +1711,63 @@ mod tests {
     #[test]
     fn is_not_terminal_running() {
         assert!(!is_terminal_status(&EmailSendStatusType::Running));
+    }
+
+    // ── poll_interval ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn builder_default_poll_interval_is_5s() {
+        let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .build()
+            .unwrap();
+        assert_eq!(client.poll_interval, DEFAULT_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn builder_respects_custom_poll_interval() {
+        let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .poll_interval(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        assert_eq!(client.poll_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn builder_poll_interval_propagates_to_service_principal() {
+        let client = ACSClientBuilder::new()
+            .host("example.com")
+            .service_principal("t", "c", "s")
+            .poll_interval(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        assert_eq!(client.poll_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn builder_poll_interval_propagates_via_connection_string() {
+        let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .poll_interval(Duration::from_millis(250))
+            .build()
+            .unwrap();
+        assert_eq!(client.poll_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn client_clone_preserves_poll_interval() {
+        let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .poll_interval(Duration::from_secs(7))
+            .build()
+            .unwrap();
+        let cloned = client.clone();
+        assert_eq!(cloned.poll_interval, Duration::from_secs(7));
     }
 }
 
@@ -2577,5 +2768,275 @@ mod integration_tests {
 
         let result = client.send_email(&minimal_email()).await;
         assert_eq!(result.unwrap(), "after-retry");
+    }
+
+    // ── send_email_and_wait ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_and_wait_returns_terminal_status() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+        let op_id = "op-wait-1";
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": op_id })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "status": "Succeeded" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let result = client
+            .send_email_and_wait(&email, Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Ok(EmailSendStatusType::Succeeded)));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_times_out() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+        let op_id = "op-wait-timeout";
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": op_id })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "Running" })))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_secs(60)) // longer than timeout
+            .build()
+            .unwrap();
+
+        let result = client
+            .send_email_and_wait(&email, Duration::from_millis(50))
+            .await;
+        assert!(matches!(result, Err(ACSError::Timeout)));
+    }
+
+    // ── send_email_idempotent ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_idempotent_sends_repeatability_headers() {
+        use wiremock::matchers::header_exists;
+
+        let server = MockServer::start().await;
+        let email = minimal_email();
+        let key = uuid::Uuid::new_v4().to_string();
+
+        Mock::given(method("POST"))
+            .and(header_exists("repeatability-request-id"))
+            .and(header_exists("repeatability-first-sent"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "op-idempotent-1" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .build()
+            .unwrap();
+
+        let result = client.send_email_idempotent(&email, &key).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn send_email_idempotent_returns_operation_id() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+        let key = uuid::Uuid::new_v4().to_string();
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "idempotent-op-42" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .build()
+            .unwrap();
+
+        let result = client.send_email_idempotent(&email, &key).await;
+        assert_eq!(result.unwrap(), "idempotent-op-42");
+    }
+
+    #[tokio::test]
+    async fn send_email_idempotent_retries_on_429_preserves_key() {
+        use wiremock::matchers::header_exists;
+
+        let server = MockServer::start().await;
+        let email = minimal_email();
+        let key = uuid::Uuid::new_v4().to_string();
+
+        // First request: 429; second attempt: 202
+        Mock::given(method("POST"))
+            .and(header_exists("repeatability-request-id"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header_exists("repeatability-request-id"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "idempotent-retry-op" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .max_retries(1)
+            .build()
+            .unwrap();
+
+        let result = client.send_email_idempotent(&email, &key).await;
+        assert_eq!(result.unwrap(), "idempotent-retry-op");
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_returns_failed_status() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "op-fail" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "status": "Failed" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let result = client
+            .send_email_and_wait(&email, Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Ok(EmailSendStatusType::Failed)));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_send_fails_returns_send_error() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(
+                json!({ "error": { "code": "InternalError", "message": "boom" } }),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .max_retries(0)
+            .build()
+            .unwrap();
+
+        let result = client
+            .send_email_and_wait(&email, Duration::from_secs(5))
+            .await;
+        // Must be a send-level Api error, not Timeout
+        assert!(matches!(result, Err(ACSError::Api { .. })));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_poll_error_propagates() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "op-poll-err" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(
+                json!({ "error": { "code": "OperationNotFound", "message": "not found" } }),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let result = client
+            .send_email_and_wait(&email, Duration::from_secs(5))
+            .await;
+        // Must be a poll-level Api error, not Timeout
+        assert!(matches!(result, Err(ACSError::Api { .. })));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_running_then_succeeded() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "op-running-ok" })),
+            )
+            .mount(&server)
+            .await;
+        // First GET: Running; subsequent GETs: Succeeded
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "status": "Running" })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "status": "Succeeded" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let result = client
+            .send_email_and_wait(&email, Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Ok(EmailSendStatusType::Succeeded)));
     }
 }
