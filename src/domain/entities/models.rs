@@ -430,11 +430,17 @@ impl EmailAttachmentBuilder {
         self
     }
 
-    /// Builds the `EmailAttachment` instance.
+    /// Builds the `EmailAttachment` instance synchronously.
+    ///
+    /// **Warning:** when a `file_to_base64` path is set this method performs
+    /// blocking file I/O (`std::fs`) on the calling thread.  Calling it from
+    /// inside a Tokio async task will block the executor thread for the
+    /// duration of the read.  Use [`build_async`](Self::build_async) instead
+    /// when you are in an async context.
     ///
     /// # Returns
     ///
-    /// * `Result<EmailAttachment, &\`static str\>` - The built `EmailAttachment` instance or an error message.
+    /// * `Result<EmailAttachment, String>` - The built `EmailAttachment` or an error.
     pub fn build(mut self) -> Result<EmailAttachment, String> {
         let content_bytes_base64 = match self.file_path {
             Some(file_path) => {
@@ -445,20 +451,15 @@ impl EmailAttachmentBuilder {
                 let name = path
                     .file_name()
                     .ok_or("File name is required".to_string())?;
-                self.name = Some(name.to_string_lossy().to_string());
-                // Open the file
+                self.name = Some(name.to_string_lossy().into_owned());
                 let mut file =
                     File::open(file_path).map_err(|e| format!("Failed to open file {:?}", e))?;
-                // Read the file contents into a byte vector
                 let mut buffer = Vec::new();
                 file.read_to_end(&mut buffer)
                     .map_err(|e| format!("Failed to read file {:?}", e))?;
-                // Infer the content type of the file
-                let content_type = infer::Infer::new()
-                    .get(&buffer)
-                    .map(|info| info.mime_type().to_string())
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
-
+                let content_type = infer::get(&buffer)
+                    .map(|t| t.mime_type())
+                    .unwrap_or("application/octet-stream");
                 self.attachment_type = Some(content_type.to_string());
                 // Encode the byte vector to a Base64 string
                 general_purpose::STANDARD.encode(&buffer)
@@ -485,22 +486,21 @@ impl EmailAttachmentBuilder {
                 if !path.exists() {
                     return Err("File does not exist".to_string());
                 }
-                let name = path
-                    .file_name()
-                    .ok_or("File name is required".to_string())?
-                    .to_string_lossy()
-                    .to_string();
-                self.name = Some(name);
+                self.name = Some(
+                    path.file_name()
+                        .ok_or("File name is required".to_string())?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
 
                 let buffer = tokio::fs::read(&path)
                     .await
                     .map_err(|e| format!("Failed to read file: {}", e))?;
 
-                let content_type = infer::Infer::new()
-                    .get(&buffer)
-                    .map(|info| info.mime_type().to_string())
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
-                self.attachment_type = Some(content_type);
+                let content_type = infer::get(&buffer)
+                    .map(|t| t.mime_type())
+                    .unwrap_or("application/octet-stream");
+                self.attachment_type = Some(content_type.to_string());
 
                 general_purpose::STANDARD.encode(&buffer)
             }
@@ -641,18 +641,18 @@ impl Serialize for HeaderSet {
     where
         S: serde::Serializer,
     {
-        let mut headers_map = std::collections::BTreeMap::new();
-        for header in self
+        use serde::ser::SerializeMap;
+        let valid = self
             .0
             .iter()
-            .filter(|header| header.name.is_some() && header.value.is_some())
-        {
-            headers_map.insert(
-                header.name.as_ref().unwrap(),
-                header.value.as_ref().unwrap(),
-            );
+            .filter(|h| h.name.is_some() && h.value.is_some());
+        // Count without collecting so no intermediate Vec is allocated.
+        let count = valid.clone().count();
+        let mut map = serializer.serialize_map(Some(count))?;
+        for h in valid {
+            map.serialize_entry(h.name.as_ref().unwrap(), h.value.as_ref().unwrap())?;
         }
-        headers_map.serialize(serializer)
+        map.end()
     }
 }
 

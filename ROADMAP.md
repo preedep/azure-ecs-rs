@@ -33,13 +33,25 @@
 
 ---
 
-## Phase 4 — Ergonomics (v0.3.0) ✅ complete
+## Phase 4 — Ergonomics (v0.2.0) ✅ complete
 
 | # | Feature | Status |
 |---|---|---|
 | 7 | `Stream`-based status polling — `send_email_stream() -> impl Stream<Item = Result<EmailSendStatusType, ACSError>>` | ✅ |
 
 **Why:** More composable and cancellable than the current callback API. The callback form stays for backward compat.
+
+---
+
+## Phase 7 — v0.3.0
+
+| # | Feature | Status |
+|---|---|---|
+| 11 | **Batch send** — `send_emails_batch(emails: &[SentEmail]) -> Vec<Result<String, ACSError>>` sends multiple emails concurrently and collects results | ✅ |
+| 12 | **Cancellation support** — `send_email_stream_cancellable` and `send_email_with_callback_cancellable` accept a `tokio_util::sync::CancellationToken`; cancellation stops polling cleanly | ✅ |
+| 13 | **Pool-friendly builder docs + `ACSClient: Clone`** — explicit documentation and examples showing `build()`-once / `clone()`-into-pool pattern; `Clone` verified with unit tests | ✅ |
+
+**Why:** Batch send reduces round-trips for bulk workloads. Cancellation makes long-running polls safe in request-scoped contexts (e.g. axum handlers). The pool-friendly builder pattern eliminates a common mistake where callers call `build()` in a hot loop, re-creating the TLS connection on every request.
 
 ---
 

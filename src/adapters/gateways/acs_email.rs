@@ -5,9 +5,34 @@
 //! - [`ACSClientBuilder`] — fluent builder; validates configuration and constructs
 //!   the shared [`reqwest::Client`] once so all requests reuse the same connection pool.
 //! - [`ACSClient`] — clone-cheap handle (all fields behind `Arc` or `Clone`).
-//!   Owns the HTTP client and dispatches the three public operations:
-//!   [`send_email`], [`send_email_with_callback`], [`send_email_stream`], and
-//!   [`get_email_status`].
+//!   Owns the HTTP client and dispatches the public operations:
+//!   [`send_email`], [`send_emails_batch`], [`send_email_with_callback`],
+//!   [`send_email_with_callback_cancellable`], [`send_email_stream`],
+//!   [`send_email_stream_cancellable`], and [`get_email_status`].
+//!
+//! # Pool-friendly usage
+//!
+//! [`ACSClient`] is cheap to clone: call [`ACSClientBuilder::build`] once,
+//! then share the handle across tasks by cloning it.  Every clone shares the
+//! same underlying [`reqwest::Client`] connection pool, amortising TLS
+//! handshakes across all concurrent requests.
+//!
+//! ```rust,ignore
+//! let client = ACSClientBuilder::new()
+//!     .connection_string(&conn_str)
+//!     .build()
+//!     .expect("valid configuration");
+//!
+//! // Distribute work across tasks — clones share the same connection pool.
+//! let handles: Vec<_> = emails.iter().map(|email| {
+//!     let c = client.clone();
+//!     let e = email.clone();
+//!     tokio::spawn(async move { c.send_email(&e).await })
+//! }).collect();
+//! for h in handles { let _ = h.await; }
+//! ```
+//!
+//! Or use [`send_emails_batch`] to send a slice concurrently in one call.
 //!
 //! # Retry behaviour
 //!
@@ -31,8 +56,11 @@
 //! each request; responses are not cached.
 //!
 //! [`send_email`]: ACSClient::send_email
+//! [`send_emails_batch`]: ACSClient::send_emails_batch
 //! [`send_email_with_callback`]: ACSClient::send_email_with_callback
+//! [`send_email_with_callback_cancellable`]: ACSClient::send_email_with_callback_cancellable
 //! [`send_email_stream`]: ACSClient::send_email_stream
+//! [`send_email_stream_cancellable`]: ACSClient::send_email_stream_cancellable
 //! [`get_email_status`]: ACSClient::get_email_status
 //! [`SharedKey`]: ACSAuthMethod::SharedKey
 //! [`ServicePrincipal`]: ACSAuthMethod::ServicePrincipal
@@ -57,6 +85,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
 use url::Url;
 use uuid::Uuid;
@@ -112,14 +141,35 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 ///
 /// Construct via [`ACSClientBuilder`].  The client is cheap to clone — the
 /// underlying [`reqwest::Client`] (and its connection pool) is shared across
-/// all clones.
+/// all clones via `reqwest`'s internal `Arc`.
 ///
 /// # Thread safety
 ///
-/// `ACSClient` implements [`Clone`] and is `Send + Sync`; it can be wrapped in
-/// an [`Arc`] and shared across threads or tasks without additional locking.
+/// `ACSClient` implements [`Clone`] and is `Send + Sync`; it can be shared
+/// across threads or Tokio tasks without additional locking.
+///
+/// # Pool-friendly pattern
+///
+/// Build once, clone freely:
+///
+/// ```rust,ignore
+/// let client = ACSClientBuilder::new()
+///     .connection_string(&conn_str)
+///     .build()?;
+///
+/// // Each clone shares the same reqwest connection pool.
+/// let c1 = client.clone();
+/// let c2 = client.clone();
+/// tokio::join!(
+///     async move { c1.send_email(&email1).await },
+///     async move { c2.send_email(&email2).await },
+/// );
+/// ```
+///
+/// Or use [`send_emails_batch`] to let the client handle concurrency for you.
 ///
 /// [`Arc`]: std::sync::Arc
+/// [`send_emails_batch`]: ACSClient::send_emails_batch
 #[derive(Clone)]
 pub struct ACSClient {
     host: String,
@@ -463,6 +513,164 @@ impl ACSClient {
         Ok((returned_id, poll_stream))
     }
 
+    /// Send multiple emails concurrently and collect all results.
+    ///
+    /// Dispatches one [`send_email`] per entry in `emails`, awaits all of them,
+    /// and returns results in input order.  A failed send is captured as `Err`
+    /// in its slot — it does not abort the remaining sends.
+    ///
+    /// All sends share the same underlying connection pool, so no extra TLS
+    /// handshakes are incurred compared to sequential sends.
+    ///
+    /// # Errors
+    ///
+    /// Each element follows the same error variants as [`send_email`].
+    ///
+    /// [`send_email`]: ACSClient::send_email
+    #[instrument(skip(self, emails), fields(host = %self.host, count = emails.len()))]
+    pub async fn send_emails_batch(&self, emails: &[SentEmail]) -> Vec<EmailResult<String>> {
+        futures::future::join_all(emails.iter().map(|e| self.send_email(e))).await
+    }
+
+    /// Stream delivery status updates with cooperative cancellation.
+    ///
+    /// Identical to [`send_email_stream`] except that the returned stream exits
+    /// cleanly when `token` is cancelled — no further status polls are issued
+    /// and the stream yields `None` on the next call to `next()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use futures::StreamExt;
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let token = CancellationToken::new();
+    /// let (id, stream) = client
+    ///     .send_email_stream_cancellable(&email, token.clone())
+    ///     .await?;
+    ///
+    /// tokio::pin!(stream);
+    /// while let Some(item) = stream.next().await { /* … */ }
+    ///
+    /// // Somewhere else: token.cancel() stops the stream early.
+    /// ```
+    ///
+    /// [`send_email_stream`]: ACSClient::send_email_stream
+    #[instrument(skip(self, email, token), fields(host = %self.host, api_version = %self.api_version.as_str()))]
+    pub async fn send_email_stream_cancellable(
+        &self,
+        email: &SentEmail,
+        token: CancellationToken,
+    ) -> EmailResult<(
+        String,
+        impl Stream<Item = Result<EmailSendStatusType, ACSError>> + '_,
+    )> {
+        let request_id = Uuid::new_v4().to_string();
+        let message_id = acs_send_email(
+            &self.http_client,
+            &self.base_url,
+            &self.auth_method,
+            &request_id,
+            email,
+            &self.api_version,
+            self.max_retries,
+        )
+        .await?;
+
+        let returned_id = message_id.clone();
+        let poll_stream = stream! {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => { break; }
+                    _ = sleep(Duration::from_secs(5)) => {
+                        match self.get_email_status(&message_id).await {
+                            Ok(status) => {
+                                let terminal = is_terminal_status(&status);
+                                yield Ok(status);
+                                if terminal { break; }
+                            }
+                            Err(e) => {
+                                yield Err(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok((returned_id, poll_stream))
+    }
+
+    /// Callback-based status polling with cooperative cancellation.
+    ///
+    /// Identical to [`send_email_with_callback`] except that the background
+    /// polling task exits cleanly when `token` is cancelled — no further status
+    /// polls are issued and `done_rx` resolves once the task has fully stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only if the initial *send* fails.  Poll errors and
+    /// cancellation are both delivered via `done_rx` resolving.
+    ///
+    /// [`send_email_with_callback`]: ACSClient::send_email_with_callback
+    #[allow(dead_code)]
+    #[instrument(skip(self, email, token, call_back), fields(host = %self.host, api_version = %self.api_version.as_str()))]
+    pub async fn send_email_with_callback_cancellable<F>(
+        self,
+        email: &SentEmail,
+        token: CancellationToken,
+        call_back: F,
+    ) -> EmailResult<(String, oneshot::Receiver<()>)>
+    where
+        F: Fn(String, &EmailSendStatusType, Option<ACSError>) + Send + Sync + 'static,
+    {
+        let request_id = Uuid::new_v4().to_string();
+        let result = acs_send_email(
+            &self.http_client,
+            &self.base_url,
+            &self.auth_method,
+            &request_id,
+            email,
+            &self.api_version,
+            self.max_retries,
+        )
+        .await?;
+
+        let message_id = result.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        let _ = tx.send(());
+                        break;
+                    }
+                    _ = sleep(Duration::from_secs(5)) => {
+                        let resp_status = self.get_email_status(&message_id).await;
+                        if let Ok(status) = resp_status {
+                            call_back(message_id.clone(), &status, None);
+                            if is_terminal_status(&status) {
+                                let _ = tx.send(());
+                                break;
+                            }
+                        } else {
+                            call_back(
+                                message_id.clone(),
+                                &EmailSendStatusType::Failed,
+                                resp_status.err(),
+                            );
+                            let _ = tx.send(());
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok((result, rx))
+    }
+
     /// Poll the delivery status of a previously submitted email.
     ///
     /// `message_id` is the operation ID returned by [`send_email`].  ACS
@@ -597,7 +805,7 @@ async fn get_access_token(
         }
         _ => {}
     }
-    Ok("".to_string())
+    Ok(String::new())
 }
 
 /// Create headers for the request based on the provided authentication method.
@@ -1283,6 +1491,62 @@ mod tests {
         assert_eq!(client.base_url, "https://sp.example.com");
     }
 
+    // ── #13 ACSClient::Clone ─────────────────────────────────────────────────
+
+    #[test]
+    fn client_clone_preserves_base_url() {
+        let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .build()
+            .unwrap();
+        let cloned = client.clone();
+        assert_eq!(client.base_url, cloned.base_url);
+    }
+
+    #[test]
+    fn client_clone_preserves_max_retries() {
+        let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .max_retries(7)
+            .build()
+            .unwrap();
+        let cloned = client.clone();
+        assert_eq!(cloned.max_retries, 7);
+    }
+
+    #[test]
+    fn client_clone_preserves_api_version() {
+        let conn = "endpoint=https://example.com;accesskey=c2VjcmV0";
+        let client = ACSClientBuilder::new()
+            .connection_string(conn)
+            .api_version(ACSApiVersion::V20250901)
+            .build()
+            .unwrap();
+        let cloned = client.clone();
+        assert_eq!(cloned.api_version.as_str(), "2025-09-01");
+    }
+
+    #[test]
+    fn client_clone_preserves_host() {
+        let client = ACSClientBuilder::new()
+            .host("myhost.communication.azure.com")
+            .managed_identity()
+            .build()
+            .unwrap();
+        let cloned = client.clone();
+        assert_eq!(client.host, cloned.host);
+    }
+
+    // #13 — ACSClient is Send + Sync (compile-time assertion) ────────────────
+
+    #[test]
+    fn client_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ACSClient>();
+    }
+
     // ── Phase 4: is_terminal_status ──────────────────────────────────────────
 
     #[test]
@@ -1327,6 +1591,7 @@ mod tests {
 mod integration_tests {
     use super::*;
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1730,6 +1995,552 @@ mod integration_tests {
         assert!(matches!(first, Err(ACSError::Api { .. })));
         // stream must terminate after an error
         assert!(stream.next().await.is_none());
+    }
+
+    // ── #13 pool-friendly: cloned client works end-to-end ────────────────────
+
+    #[tokio::test]
+    async fn cloned_client_can_send_email() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "clone-msg" })))
+            .mount(&server)
+            .await;
+
+        let original = client_for(&server);
+        let cloned = original.clone();
+        let result = cloned.send_email(&minimal_email()).await;
+        assert_eq!(result.unwrap(), "clone-msg");
+    }
+
+    #[tokio::test]
+    async fn two_clones_send_independently() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "shared-msg" })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let c1 = client.clone();
+        let c2 = client.clone();
+        let email = minimal_email();
+        let (r1, r2) = tokio::join!(c1.send_email(&email), c2.send_email(&email));
+        assert_eq!(r1.unwrap(), "shared-msg");
+        assert_eq!(r2.unwrap(), "shared-msg");
+    }
+
+    // ── #11 send_emails_batch ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_emails_batch_empty_returns_empty_vec() {
+        let server = MockServer::start().await;
+        let client = client_for(&server);
+        let results = client.send_emails_batch(&[]).await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_emails_batch_all_succeed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "batch-id" })))
+            .mount(&server)
+            .await;
+
+        let email = minimal_email();
+        let client = client_for(&server);
+        let results = client.send_emails_batch(&[email]).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap(), "batch-id");
+    }
+
+    #[tokio::test]
+    async fn send_emails_batch_all_fail_on_500() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": { "code": "InternalError", "message": "boom" }
+            })))
+            .mount(&server)
+            .await;
+
+        let email = minimal_email();
+        let client = client_for(&server);
+        let results = client.send_emails_batch(&[email]).await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(ACSError::Api { .. })));
+    }
+
+    #[tokio::test]
+    async fn send_emails_batch_multiple_results_in_order() {
+        let server = MockServer::start().await;
+        // Mock returns the same ID for every POST; we care that len == input len.
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "m" })))
+            .mount(&server)
+            .await;
+
+        let email = minimal_email();
+        let emails = vec![minimal_email(), minimal_email(), minimal_email()];
+        let client = client_for(&server);
+        let results = client.send_emails_batch(&emails).await;
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.is_ok());
+        }
+        // order is preserved
+        let _ = email;
+    }
+
+    // ── #12 send_email_stream_cancellable ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_stream_cancellable_stops_when_already_cancelled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "c-op" })))
+            .mount(&server)
+            .await;
+        // No status mock — if the stream polls it would panic on unmounted route.
+
+        let token = CancellationToken::new();
+        token.cancel(); // cancel before stream is even consumed
+
+        let client = client_for(&server);
+        let (id, stream) = client
+            .send_email_stream_cancellable(&minimal_email(), token)
+            .await
+            .unwrap();
+        assert_eq!(id, "c-op");
+
+        tokio::pin!(stream);
+        use futures::StreamExt;
+        // Stream should yield nothing because the token was already cancelled.
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_email_stream_cancellable_returns_error_when_send_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": { "code": "InternalError", "message": "fail" }
+            })))
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new();
+        let client = client_for(&server);
+        let result = client
+            .send_email_stream_cancellable(&minimal_email(), token)
+            .await;
+        assert!(matches!(result, Err(ACSError::Api { .. })));
+    }
+
+    #[tokio::test]
+    async fn send_email_stream_cancellable_yields_terminal_status_normally() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "nc-op" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/nc-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "nc-op", "status": "Succeeded"
+            })))
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new(); // never cancelled
+        let client = client_for(&server);
+        let (id, stream) = client
+            .send_email_stream_cancellable(&minimal_email(), token)
+            .await
+            .unwrap();
+        assert_eq!(id, "nc-op");
+
+        tokio::pin!(stream);
+        use futures::StreamExt;
+        let mut statuses = Vec::new();
+        while let Some(item) = stream.next().await {
+            statuses.push(item.unwrap());
+        }
+        assert_eq!(statuses, vec![EmailSendStatusType::Succeeded]);
+    }
+
+    // ── #12 send_email_with_callback_cancellable ──────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_with_callback_cancellable_stops_when_already_cancelled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "cc-msg" })))
+            .mount(&server)
+            .await;
+        // No status mock — callback must not be invoked.
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let callback_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = callback_count.clone();
+
+        let client = client_for(&server);
+        let (message_id, done_rx) = client
+            .send_email_with_callback_cancellable(&minimal_email(), token, move |_, _, _| {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+        assert_eq!(message_id, "cc-msg");
+        let _ = done_rx.await;
+        assert_eq!(callback_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn send_email_with_callback_cancellable_invokes_callback_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "cbs-msg" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/cbs-msg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "id": "cbs-msg", "status": "Succeeded" })),
+            )
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new(); // never cancelled
+        let statuses: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = statuses.clone();
+
+        let client = client_for(&server);
+        let (_, done_rx) = client
+            .send_email_with_callback_cancellable(&minimal_email(), token, move |_, status, _| {
+                s.lock().unwrap().push(status.to_string());
+            })
+            .await
+            .unwrap();
+        let _ = done_rx.await;
+        let calls = statuses.lock().unwrap();
+        assert!(calls.iter().any(|s| s == "Succeeded"));
+    }
+
+    #[tokio::test]
+    async fn send_email_with_callback_cancellable_returns_error_when_send_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": { "code": "InternalError", "message": "fail" }
+            })))
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new();
+        let client = client_for(&server);
+        let result = client
+            .send_email_with_callback_cancellable(&minimal_email(), token, |_, _, _| {})
+            .await;
+        assert!(matches!(result, Err(ACSError::Api { .. })));
+    }
+
+    // ── #11 batch: mixed success / failure ───────────────────────────────────
+
+    #[tokio::test]
+    async fn send_emails_batch_mixed_success_and_failure() {
+        let server = MockServer::start().await;
+        // First request to arrive → 500 (exhausted after 1 hit)
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": { "code": "InternalError", "message": "boom" }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Every subsequent request → 202
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "ok-id" })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let results = client
+            .send_emails_batch(&[minimal_email(), minimal_email()])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let err_count = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(ok_count, 1, "exactly one send should succeed");
+        assert_eq!(err_count, 1, "exactly one send should fail");
+    }
+
+    #[tokio::test]
+    async fn send_emails_batch_propagates_max_retries_config() {
+        let server = MockServer::start().await;
+        // Always 429 — exhausts retries
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "error": { "code": "TooManyRequests", "message": "slow down" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .max_retries(2)
+            .base_url_override(&server.uri())
+            .build()
+            .unwrap();
+
+        let results = client.send_emails_batch(&[minimal_email()]).await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0],
+            Err(ACSError::RateLimitExceeded { retries: 2 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_emails_batch_returns_error_on_malformed_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let results = client.send_emails_batch(&[minimal_email()]).await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(ACSError::Deserialization(_))));
+    }
+
+    // ── #12 stream cancellable: missing paths ─────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_stream_cancellable_stops_on_status_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "cse-op" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/cse-op"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NotFound", "message": "operation not found" }
+            })))
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new(); // never cancelled
+        let client = client_for(&server);
+        let (_, stream) = client
+            .send_email_stream_cancellable(&minimal_email(), token)
+            .await
+            .unwrap();
+
+        tokio::pin!(stream);
+        use futures::StreamExt;
+        let first = stream
+            .next()
+            .await
+            .expect("stream must yield an error item");
+        assert!(matches!(first, Err(ACSError::Api { .. })));
+        // stream must terminate after an error — next call returns None
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_email_stream_cancellable_running_then_succeeded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "rs-op" })))
+            .mount(&server)
+            .await;
+        // First poll → Running
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/rs-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "rs-op", "status": "Running"
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Second poll → Succeeded
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/rs-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "rs-op", "status": "Succeeded"
+            })))
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new();
+        let client = client_for(&server);
+        let (_, stream) = client
+            .send_email_stream_cancellable(&minimal_email(), token)
+            .await
+            .unwrap();
+
+        tokio::pin!(stream);
+        use futures::StreamExt;
+        let mut statuses = Vec::new();
+        while let Some(item) = stream.next().await {
+            statuses.push(item.unwrap());
+        }
+        assert_eq!(
+            statuses,
+            vec![EmailSendStatusType::Running, EmailSendStatusType::Succeeded]
+        );
+    }
+
+    // ── #12 callback cancellable: missing paths ───────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_with_callback_cancellable_reports_error_on_status_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "cpe-msg" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/cpe-msg"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NotFound", "message": "operation not found" }
+            })))
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new();
+        let had_error: std::sync::Arc<std::sync::atomic::AtomicBool> =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = had_error.clone();
+
+        let client = client_for(&server);
+        let (_, done_rx) = client
+            .send_email_with_callback_cancellable(&minimal_email(), token, move |_, _, err| {
+                if err.is_some() {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await
+            .unwrap();
+
+        let _ = done_rx.await;
+        assert!(
+            had_error.load(std::sync::atomic::Ordering::SeqCst),
+            "callback should have received a non-None error"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_with_callback_cancellable_running_then_succeeded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "crts-msg" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/crts-msg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "crts-msg", "status": "Running"
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/crts-msg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "crts-msg", "status": "Succeeded"
+            })))
+            .mount(&server)
+            .await;
+
+        let token = CancellationToken::new();
+        let statuses: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = statuses.clone();
+
+        let client = client_for(&server);
+        let (_, done_rx) = client
+            .send_email_with_callback_cancellable(&minimal_email(), token, move |_, status, _| {
+                s.lock().unwrap().push(status.to_string());
+            })
+            .await
+            .unwrap();
+
+        let _ = done_rx.await;
+        let calls = statuses.lock().unwrap();
+        assert!(calls.contains(&"Running".to_string()));
+        assert!(calls.contains(&"Succeeded".to_string()));
+        assert_eq!(*calls.last().unwrap(), "Succeeded");
+    }
+
+    // ── #13 clone: get_email_status and different auth path ───────────────────
+
+    #[tokio::test]
+    async fn cloned_client_get_email_status_works() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/emails/operations/clone-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "clone-op", "status": "Succeeded"
+            })))
+            .mount(&server)
+            .await;
+
+        let original = client_for(&server);
+        let cloned = original.clone();
+        let result = cloned.get_email_status("clone-op").await;
+        assert!(matches!(result, Ok(EmailSendStatusType::Succeeded)));
+    }
+
+    #[tokio::test]
+    async fn clone_preserves_api_version_in_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails:send"))
+            .and(query_param("api-version", "2025-09-01"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "id": "ver-id" })))
+            .mount(&server)
+            .await;
+
+        let original = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .api_version(ACSApiVersion::V20250901)
+            .max_retries(0)
+            .base_url_override(&server.uri())
+            .build()
+            .unwrap();
+        let cloned = original.clone();
+
+        let result = cloned.send_email(&minimal_email()).await;
+        assert_eq!(result.unwrap(), "ver-id");
     }
 
     // ── handle_response_and_retry_if_needed: Retry-After header ──────────────

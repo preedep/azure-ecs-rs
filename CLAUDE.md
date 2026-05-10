@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                                          # build
-cargo test                                           # run all 110 tests (unit + integration)
+cargo test                                           # run all 136 tests (unit + integration)
 cargo clippy -- -D warnings                          # lint (must pass clean for CI)
 cargo fmt --check                                    # format check (must pass clean for CI)
 cargo test <name>                                    # run a single test by name substring
@@ -64,6 +64,32 @@ Live in `mod integration_tests` inside `acs_email.rs`. Use `wiremock` to start a
 | `send_email_stream_stops_on_status_error` | Send 202, status 404 → stream yields `Err` then terminates |
 
 **How it works:** `ACSClientBuilder` has a `#[cfg(test)] pub(crate) fn base_url_override(url: &str)` method that replaces the computed `https://<host>` with the wiremock server URI. Auth headers are computed with a dummy shared key; the mock server ignores them.
+
+### Azure E2E tests
+
+Live in `tests/azure_e2e.rs`. Every test is marked `#[ignore]` — skipped by `cargo test`, run explicitly:
+
+```bash
+CONNECTION_STR="…" SENDER="…" TO_EMAIL="…" \
+cargo test --test azure_e2e -- --include-ignored --nocapture
+```
+
+A separate CI workflow (`.github/workflows/azure_e2e.yml`) runs these on `develop` / `main` using GitHub Actions secrets. See **ADR-003** for design rationale.
+
+| Test | Auth | What only real Azure can prove |
+|---|---|---|
+| `shared_key_send_email_accepted` | SharedKey | HMAC-SHA256 signature accepted by Azure |
+| `shared_key_get_email_status_after_send` | SharedKey | Operation ID is a real pollable UUID |
+| `shared_key_send_email_v20250901` | SharedKey | API version `2025-09-01` accepted |
+| `shared_key_send_email_stream_yields_at_least_one_status` | SharedKey | Stream polling against live server |
+| `shared_key_send_email_stream_cancellable_stops_cleanly` | SharedKey | Cancellation does not hang against live server |
+| `shared_key_send_emails_batch_all_accepted` | SharedKey | Concurrent batch dispatch accepted |
+| `service_principal_send_email_accepted` | ServicePrincipal | OAuth2 token acquisition + bearer auth |
+| `service_principal_get_email_status_after_send` | ServicePrincipal | Status polling with bearer auth |
+| `managed_identity_send_email_accepted` | ManagedIdentity | Ambient credential (cloud-only) |
+| `cloned_client_sends_independently` | SharedKey | Both `ACSClient` clones reach Azure |
+
+**Required env vars:** `CONNECTION_STR`, `SENDER`, `TO_EMAIL` for SharedKey tests; additionally `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `ASC_URL` for ServicePrincipal; `ASC_URL` for ManagedIdentity. Use a dedicated test mailbox for `TO_EMAIL`.
 
 ## Architecture
 
@@ -206,3 +232,128 @@ Significant design decisions are captured in `docs/adr/`:
 **CI** runs two jobs in parallel: `test` (`cargo build` + `cargo test`) and `lint` (`cargo clippy -- -D warnings` + `cargo fmt --check`).
 
 **Release** requires the git tag to match the version in `Cargo.toml`, then runs full CI, publishes to crates.io (`CARGO_REGISTRY_TOKEN` secret required), and creates a GitHub Release with auto-generated notes.
+
+## Rust performance patterns
+
+Rules applied in this codebase. Follow them when adding or reviewing code.
+
+### Allocations
+
+| Pattern | Avoid | Prefer |
+|---|---|---|
+| String from `&'static str` | `"literal".to_string()` when a zero-alloc alternative exists | `String::new()` for empty, `string.to_owned()` / `into_owned()` when already have a `Cow` |
+| `Cow<str>` to `String` | `.to_string_lossy().to_string()` (two steps, may allocate twice) | `.to_string_lossy().into_owned()` (one step, returns the `Owned` variant directly) |
+| `String` re-clone | `.to_string()` on a value already `String` | move or borrow; only clone when two owners are genuinely needed |
+| Intermediate collection | Building a temporary `Vec` / `BTreeMap` just to iterate it | Two-pass iterator (`.count()` then re-iterate) or `serialize_map(None)` |
+| MIME detection | `infer::Infer::new().get(buf)` (creates struct per call) | `infer::get(buf)` (free function, same cost, clearer intent) |
+
+### Async / blocking
+
+- **Never call `std::fs` inside a Tokio task.** `EmailAttachmentBuilder::build()` does blocking I/O — always use `build_async()` in async contexts to avoid blocking the executor thread.
+- Hold `Arc<reqwest::Client>` / clone `ACSClient` (cheap) — never call `ACSClientBuilder::build()` inside a hot loop; it re-creates the TLS connection pool.
+- Prefer `tokio::sync::Mutex` over `std::sync::Mutex` when the lock is held across `.await` points.
+
+### Serialization
+
+- `HeaderSet::Serialize` uses `serialize_map` with a two-pass count to avoid a `BTreeMap` allocation per email send. Keep this pattern for any custom `Serialize` impl that knows its element count up front.
+- `skip_serializing_if = "Option::is_none"` is set on every optional field in `SentEmail` — do not remove these attributes; they prevent sending `null` fields to the ACS API.
+
+### Concurrency
+
+- `send_emails_batch` uses `futures::future::join_all` over `&[SentEmail]` — all sends share the same `reqwest::Client` connection pool, so concurrency is free beyond the first request.
+- `CancellationToken` polling uses `tokio::select!` to race the sleep against cancellation — do not replace with manual flag polling or channel receives, which are less efficient and harder to reason about.
+
+### Zero-copy and memory layout
+
+The goal is to pass data through the call stack without unnecessary heap copies. Apply these rules when adding new fields, method parameters, or internal helpers.
+
+#### Borrow instead of own at function boundaries
+
+Prefer `&str` over `String` and `&[u8]` over `Vec<u8>` for read-only parameters. The caller owns the data; the callee only needs a view.
+
+```rust
+// Bad — forces the caller to allocate even when they have a &str
+fn set_host(host: String) { … }
+
+// Good — caller decides ownership; &str, String, Arc<str> all accepted
+fn set_host(host: &str) { … }
+// Builder setters in this codebase already follow this: .host("example.com")
+```
+
+#### Use `Cow<'_, str>` on return paths that sometimes own, sometimes borrow
+
+When a function returns a string that is *sometimes* a static literal and *sometimes* a freshly allocated `String` (e.g., error messages, MIME fallbacks), `Cow` avoids forcing an allocation on the literal path.
+
+```rust
+// Bad — always allocates, even for the static fallback
+fn mime_or_default(buf: &[u8]) -> String {
+    infer::get(buf)
+        .map(|t| t.mime_type().to_string())   // allocates
+        .unwrap_or_else(|| "application/octet-stream".to_string()) // allocates
+}
+
+// Good — borrows the &'static str when possible; only allocates for inferred type
+fn mime_or_default(buf: &[u8]) -> Cow<'static, str> {
+    infer::get(buf)
+        .map(|t| Cow::Owned(t.mime_type().to_string()))
+        .unwrap_or(Cow::Borrowed("application/octet-stream"))
+}
+```
+
+> The current codebase converts directly to `String` because `attachment_type: Option<String>` requires it. If that field changes to `Option<Cow<'static, str>>` in a future version this pattern becomes free.
+
+#### `Arc<str>` for shared read-only strings across tasks
+
+When the same string must be readable from multiple Tokio tasks, `Arc<str>` is cheaper than cloning a `String` into each task. The clone is a single atomic increment; the heap data is never copied.
+
+```rust
+// Bad — clones the heap content into every spawned task
+let id: String = send_email(…).await?;
+for _ in 0..workers {
+    let id = id.clone();           // full heap copy each time
+    tokio::spawn(async move { poll_status(&id).await });
+}
+
+// Good — one allocation, N atomic increments
+let id: Arc<str> = Arc::from(send_email(…).await?);
+for _ in 0..workers {
+    let id = Arc::clone(&id);      // pointer copy only
+    tokio::spawn(async move { poll_status(&id).await });
+}
+```
+
+> In this codebase the public callback API takes `String`, so `Arc<str>` is used only internally where the string does not cross the public boundary. When the callback signature is revised, prefer `Arc<str>` or `&str` over `String`.
+
+#### Do not copy attachment bytes more than once
+
+The base64 encoding path is: `Vec<u8>` (file read) → base64 `String` (encode). This is unavoidable — base64 expands the data by ~33 % and must be a new allocation. Do not add intermediate copies between the raw bytes and the encoder:
+
+```rust
+// Bad — copies raw bytes into a second Vec before encoding
+let copy = buffer.clone();
+let encoded = general_purpose::STANDARD.encode(&copy);
+
+// Good — encode directly from the buffer returned by fs::read
+let encoded = general_purpose::STANDARD.encode(&buffer);
+```
+
+#### Avoid re-encoding already-encoded content
+
+`EmailAttachmentBuilder::content_bytes_base64()` accepts pre-encoded base64. Do not base64-encode content that is already base64 — callers loading from disk should use `file_to_base64()` + `build_async()` and let the builder encode once.
+
+#### String capacity pre-allocation for URL construction
+
+`format!` with multiple segments allocates a fresh `String` sized to the result. For URLs built in hot loops (retry, batch), pre-allocate with `String::with_capacity` if the final length is known:
+
+```rust
+// Current (acceptable for cold path — format! allocates once):
+let url = format!("{}/emails:send?api-version={}", base_url, api_version.as_str());
+
+// For a hot loop with known segment lengths:
+let mut url = String::with_capacity(base_url.len() + 32);
+url.push_str(base_url);
+url.push_str("/emails:send?api-version=");
+url.push_str(api_version.as_str());
+```
+
+> The retry loop in `handle_response_and_retry_if_needed` re-uses the `url: &str` reference — no re-allocation occurs on retries. The `with_capacity` pattern is only relevant if a future change builds the URL inside the retry body.

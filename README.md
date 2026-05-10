@@ -1,54 +1,40 @@
 # Azure Email Communication Service for Rust (azure-ecs-rs)
 
-Azure Email Communication Service is part of the Azure Communication Services. It provides a REST API to send emails.
-For more information, see the [Azure Communication Services documentation](https://learn.microsoft.com/en-us/azure/communication-services/).
+[![Crates.io](https://img.shields.io/crates/v/azure-ecs-rs.svg)](https://crates.io/crates/azure-ecs-rs)
+[![docs.rs](https://img.shields.io/docsrs/azure-ecs-rs)](https://docs.rs/azure-ecs-rs)
+[![CI](https://github.com/preedep/azure-ecs-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/preedep/azure-ecs-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Azure Communication Service - Email - Rest API](https://learn.microsoft.com/en-us/rest/api/communication/email/send?tabs=HTTP)
+Rust SDK for the [Azure Email Communication Service](https://learn.microsoft.com/en-us/azure/communication-services/) data-plane REST API.
 
 ## Features
 
-- Send email (simple and with callback)
-- Stream-based status polling (`send_email_stream`)
-- Get email status
-- Attachment support with auto MIME type detection (sync and async I/O)
-- Connection reuse (`reqwest::Client` shared across all requests)
-- Typed error handling (`ACSError` enum)
-- Configurable retry with exponential backoff
-- Configurable per-request timeout
-- `tracing` integration — structured spans on all public methods
+- **Send email** — single send, batch concurrent send, callback-based polling, stream-based polling
+- **Cancellation** — `CancellationToken` support on stream and callback variants
+- **Three auth methods** — Shared Key, Service Principal, Managed Identity
+- **Connection reuse** — `reqwest::Client` built once and shared across all requests and clones
+- **Pool-friendly** — `ACSClient` is `Clone + Send + Sync`; share across tasks without locking
+- **Typed errors** — `ACSError` enum with variants for network, auth, API, rate-limit, and more
+- **Retry with backoff** — automatic retry on `429`/`503` with exponential backoff and `Retry-After` support
+- **Configurable timeout** — per-request HTTP timeout via `.timeout(Duration)`
+- **Attachment support** — sync (`build`) and async (`build_async`) paths; MIME type auto-detected
+- **`tracing` integration** — structured spans on all public methods; bridges to `log`-based subscribers
+- **Two API versions** — `2023-03-31` (default) and `2025-09-01` (opt-in)
 
 ## Authentication
 
-| Method | Builder call |
+| Method | Builder |
 |---|---|
-| Shared Key | `.connection_string(&str)` |
-| Service Principal | `.host(&str).service_principal(&tenant, &client_id, &secret)` |
-| Managed Identity | `.managed_identity().host(&str)` |
+| Shared Key | `.connection_string("endpoint=https://…;accesskey=…")` |
+| Service Principal | `.host("https://…").service_principal(&tenant, &client_id, &secret)` |
+| Managed Identity | `.host("https://…").managed_identity()` |
 
 ## API Versions
 
-| Version | Constant | Status |
+| Constant | Version | Status |
 |---|---|---|
-| `2023-03-31` | `ACSApiVersion::V20230331` | Default (backward compatible) |
-| `2025-09-01` | `ACSApiVersion::V20250901` | Latest stable — opt-in |
-
-## Environment Variables
-
-```sh
-# Common
-SENDER="noreply@yourdomain.azurecomm.net"
-REPLY_EMAIL="recipient@example.com"
-REPLY_EMAIL_DISPLAY="Recipient Name"
-
-# Shared Key
-CONNECTION_STR="endpoint=https://...;accesskey=..."
-
-# Service Principal
-CLIENT_ID="..."
-CLIENT_SECRET="..."
-TENANT_ID="..."
-ASC_URL="https://yourresource.asiapacific.communication.azure.com"
-```
+| `ACSApiVersion::V20230331` | `2023-03-31` | Default — backward compatible |
+| `ACSApiVersion::V20250901` | `2025-09-01` | Latest stable — opt-in |
 
 ## Quick Start
 
@@ -61,29 +47,24 @@ use azure_ecs_rs::adapters::gateways::acs_email::{ACSApiVersion, ACSClientBuilde
 // Shared Key
 let client = ACSClientBuilder::new()
     .connection_string(&connection_str)
-    .api_version(ACSApiVersion::V20250901) // optional; default is 2023-03-31
     .timeout(Duration::from_secs(30))
     .max_retries(3)
-    .build()
-    .expect("Failed to build ACSClient");
+    .build()?;
 
 // Service Principal
 let client = ACSClientBuilder::new()
-    .host(&host_name)
+    .host(&asc_url)
     .service_principal(&tenant_id, &client_id, &client_secret)
-    .timeout(Duration::from_secs(30))
-    .build()
-    .expect("Failed to build ACSClient");
+    .build()?;
 
 // Managed Identity
 let client = ACSClientBuilder::new()
+    .host(&asc_url)
     .managed_identity()
-    .host(&host_name)
-    .build()
-    .expect("Failed to build ACSClient");
+    .build()?;
 ```
 
-### Send email
+### Build an email
 
 ```rust
 use azure_ecs_rs::domain::entities::models::{
@@ -91,7 +72,7 @@ use azure_ecs_rs::domain::entities::models::{
 };
 
 let email = SentEmailBuilder::new()
-    .sender(sender)
+    .sender("noreply@yourdomain.azurecomm.net".to_string())
     .content(EmailContent {
         subject: Some("Hello".to_string()),
         plain_text: Some("Plain text body.".to_string()),
@@ -99,16 +80,127 @@ let email = SentEmailBuilder::new()
     })
     .recipients(Recipients {
         to: Some(vec![EmailAddress {
-            email: Some(recipient),
-            display_name: Some(display_name),
+            email: Some("recipient@example.com".to_string()),
+            display_name: Some("Recipient".to_string()),
         }]),
         cc: None,
         b_cc: None,
     })
-    .build()
-    .expect("Failed to build SentEmail");
+    .build()?;
+```
 
-let message_id = client.send_email(&email).await?;
+### Send email
+
+```rust
+let operation_id = client.send_email(&email).await?;
+println!("queued: {operation_id}");
+```
+
+### Batch send
+
+Send multiple emails concurrently. Results are returned in input order; a failed
+send is captured as `Err` in its slot and does not abort the others.
+
+```rust
+let emails = vec![email1, email2, email3];
+let results = client.send_emails_batch(&emails).await;
+
+for (i, result) in results.iter().enumerate() {
+    match result {
+        Ok(id) => println!("[{i}] queued: {id}"),
+        Err(e)  => eprintln!("[{i}] failed: {e}"),
+    }
+}
+```
+
+All sends share the same connection pool — no extra TLS handshakes beyond the first request.
+
+### Stream-based status polling
+
+```rust
+use futures::StreamExt;
+use azure_ecs_rs::domain::entities::models::EmailSendStatusType;
+
+let (operation_id, stream) = client.send_email_stream(&email).await?;
+tokio::pin!(stream);
+
+while let Some(item) = stream.next().await {
+    match item {
+        Ok(EmailSendStatusType::Succeeded) => println!("delivered!"),
+        Ok(EmailSendStatusType::Failed | EmailSendStatusType::Canceled) => {
+            eprintln!("delivery failed");
+            break;
+        }
+        Ok(status) => println!("status: {status}"),
+        Err(e) => { eprintln!("poll error: {e}"); break; }
+    }
+}
+```
+
+### Stream with cancellation
+
+```rust
+use tokio_util::sync::CancellationToken;
+use futures::StreamExt;
+
+let token = CancellationToken::new();
+
+let (operation_id, stream) = client
+    .send_email_stream_cancellable(&email, token.clone())
+    .await?;
+
+// Cancel from another task at any time:
+// token.cancel();
+
+tokio::pin!(stream);
+while let Some(item) = stream.next().await {
+    println!("status: {:?}", item);
+}
+// Stream exits cleanly when the token is cancelled.
+```
+
+### Callback with cancellation
+
+```rust
+use tokio_util::sync::CancellationToken;
+
+let token = CancellationToken::new();
+
+let (operation_id, done_rx) = client
+    .send_email_with_callback_cancellable(
+        &email,
+        token.clone(),
+        |id, status, err| {
+            if let Some(e) = err {
+                eprintln!("id={id} error={e}");
+            } else {
+                println!("id={id} status={status}");
+            }
+        },
+    )
+    .await?;
+
+// token.cancel() stops the background task early.
+let _ = done_rx.await; // resolves on terminal status or cancellation
+```
+
+### Callback (original API, backward compatible)
+
+```rust
+let (operation_id, done_rx) = client
+    .send_email_with_callback(&email, |id, status, err| {
+        println!("id={id} status={status}");
+    })
+    .await?;
+
+let _ = done_rx.await;
+```
+
+### Poll status manually
+
+```rust
+let status = client.get_email_status(&operation_id).await?;
+println!("status: {status}");
 ```
 
 ### Typed error handling
@@ -117,95 +209,59 @@ let message_id = client.send_email(&email).await?;
 use azure_ecs_rs::domain::entities::models::ACSError;
 
 match client.send_email(&email).await {
-    Ok(id) => println!("Accepted: {id}"),
-    Err(ACSError::RateLimitExceeded { retries }) => {
-        eprintln!("Rate limit after {retries} retries");
-    }
-    Err(ACSError::Auth(msg)) => {
-        eprintln!("Auth failed: {msg}");
-    }
-    Err(ACSError::Api { code, message }) => {
-        eprintln!("API error {:?}: {message}", code);
-    }
-    Err(ACSError::Network(msg)) if msg.contains("timed out") => {
-        eprintln!("Timed out — increase .timeout() or check endpoint");
-    }
-    Err(e) => eprintln!("Other error: {e}"),
+    Ok(id) => println!("queued: {id}"),
+    Err(ACSError::RateLimitExceeded { retries }) => eprintln!("rate limit after {retries} retries"),
+    Err(ACSError::Auth(msg))                     => eprintln!("auth failed: {msg}"),
+    Err(ACSError::Api { code, message })         => eprintln!("API error {code:?}: {message}"),
+    Err(ACSError::Network(msg))                  => eprintln!("network: {msg}"),
+    Err(e)                                       => eprintln!("other: {e}"),
 }
 ```
 
-### Stream-based status polling
+### Pool-friendly usage
 
-`send_email_stream` returns an `impl Stream<Item = Result<EmailSendStatusType, ACSError>>`.
-Each item is a polled status; the stream ends when a terminal state is reached
-(`Succeeded`, `Failed`, `Canceled`, `Unknown`) or an error occurs.
-
-```rust
-use futures::StreamExt;
-use azure_ecs_rs::domain::entities::models::EmailSendStatusType;
-
-let (message_id, stream) = client.send_email_stream(&email).await?;
-tokio::pin!(stream);
-
-while let Some(item) = stream.next().await {
-    match item {
-        Ok(EmailSendStatusType::Succeeded) => {
-            println!("Delivered!");
-            break;
-        }
-        Ok(EmailSendStatusType::Failed | EmailSendStatusType::Canceled) => {
-            eprintln!("Delivery failed");
-            break;
-        }
-        Ok(status) => println!("Status: {status}"),
-        Err(e) => {
-            eprintln!("Poll error: {e}");
-            break;
-        }
-    }
-}
-```
-
-### Send with callback
+`ACSClient` is cheap to clone — all clones share the same `reqwest::Client`
+connection pool. Build once and distribute across tasks:
 
 ```rust
-let (message_id, done_rx) = client
-    .send_email_with_callback(&email, |msg_id, status, err| {
-        if let Some(e) = err {
-            eprintln!("id={msg_id} error={e}");
-        } else {
-            println!("id={msg_id} status={status}");
-        }
-    })
-    .await?;
+// Build once at startup.
+let client = ACSClientBuilder::new()
+    .connection_string(&conn_str)
+    .build()?;
 
-let _ = done_rx.await; // wait for terminal state
+// Clone into each task — no extra TLS handshake per clone.
+let handles: Vec<_> = emails.iter().map(|email| {
+    let c = client.clone();
+    let e = email.clone();
+    tokio::spawn(async move { c.send_email(&e).await })
+}).collect();
+
+for h in handles { let _ = h.await; }
 ```
+
+Or use `send_emails_batch` to let the client manage concurrency for you.
 
 ### Attachments
 
 ```rust
 use azure_ecs_rs::domain::entities::models::EmailAttachmentBuilder;
 
-// Sync (blocks current thread)
-let attachment = EmailAttachmentBuilder::new()
-    .file_to_base64("report.pdf")
-    .build()
-    .expect("Failed to load attachment");
-
-// Async (non-blocking, preferred in async contexts)
+// Async (preferred in async contexts — non-blocking I/O)
 let attachment = EmailAttachmentBuilder::new()
     .file_to_base64("report.pdf")
     .build_async()
-    .await
-    .expect("Failed to load attachment");
+    .await?;
+
+// Sync (only use outside async runtimes — blocks the thread)
+let attachment = EmailAttachmentBuilder::new()
+    .file_to_base64("report.pdf")
+    .build()?;
 ```
 
-MIME type is detected automatically from the file contents; falls back to `application/octet-stream`.
+MIME type is detected automatically from the file contents and falls back to
+`application/octet-stream` for unknown types.
 
 ### Observability
-
-The library emits `tracing` spans and events. Wire up any `tracing` subscriber in your application:
 
 ```rust
 tracing_subscriber::fmt()
@@ -213,30 +269,68 @@ tracing_subscriber::fmt()
     .init();
 ```
 
-Then run with `RUST_LOG=debug` to see library spans alongside application logs.
+Run with `RUST_LOG=azure_ecs_rs=debug` to see spans for every request,
+retry, and status poll. The library also bridges to `log`-based subscribers
+via `tracing-log`, so no changes are needed if you already use `pretty_env_logger`.
+
+## Environment Variables
+
+| Variable | Used by |
+|---|---|
+| `CONNECTION_STR` | `endpoint=https://…;accesskey=…` — SharedKey auth |
+| `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` | ServicePrincipal auth |
+| `ASC_URL` | ServicePrincipal / ManagedIdentity host |
+| `SENDER` | From address (e.g. `DoNotReply@yourdomain.azurecomm.net`) |
+| `REPLY_EMAIL`, `REPLY_EMAIL_DISPLAY` | Reply-to address used in examples |
 
 ## Examples
 
-| Example | Description |
+| Command | Description |
 |---|---|
-| `cargo run --example mail` | Basic send with Shared Key |
-| `cargo run --example mail_async` | Send with callback |
-| `cargo run --example mail_attach` | Send with file attachment (sync) |
-| `cargo run --example mail_error_handling` | Typed `ACSError` matching + status poll loop |
-| `cargo run --example mail_retry_timeout` | Retry/timeout configuration |
-| `cargo run --example mail_attach_async` | Non-blocking attachment + full tracing setup |
-| `cargo run --example mail_stream` | Stream-based status polling with `send_email_stream` |
+| `cargo run --example mail` | Basic send — Shared Key |
+| `cargo run --example mail_async` | Callback-based polling |
+| `cargo run --example mail_attach` | File attachment (sync build) |
+| `cargo run --example mail_attach_async` | File attachment (async build) + tracing |
+| `cargo run --example mail_error_handling` | Typed `ACSError` matching |
+| `cargo run --example mail_retry_timeout` | Retry and timeout configuration |
+| `cargo run --example mail_stream` | Stream-based status polling |
 
 Prefix any example with `RUST_LOG=debug` to enable tracing output.
 
-## Changelog
+## Testing
 
-See [CHANGELOG.md](CHANGELOG.md) for release history.
+```bash
+cargo test                          # 136 unit + wiremock tests — no credentials needed
+cargo test --test azure_e2e -- --include-ignored   # real Azure E2E (credentials required)
+```
 
-## Get email credentials from Azure Portal
+The test suite has three tiers:
+
+| Tier | Location | Credentials | What it covers |
+|---|---|---|---|
+| Unit | `src/**` `#[cfg(test)]` | None | Logic, builders, error variants, serialization |
+| Wiremock integration | `mod integration_tests` in `acs_email.rs` | None | HTTP paths, retry, backoff, stream, batch, cancellation |
+| Azure E2E | `tests/azure_e2e.rs` (`#[ignore]`) | Required | Auth validity, schema acceptance, real operation IDs |
+
+See `docs/adr/ADR-002` and `docs/adr/ADR-003` for design rationale.
+
+To run E2E tests locally:
+
+```bash
+CONNECTION_STR="endpoint=https://…;accesskey=…" \
+SENDER="DoNotReply@yourdomain.azurecomm.net" \
+TO_EMAIL="recipient@example.com" \
+cargo test --test azure_e2e -- --include-ignored --nocapture
+```
+
+## Get credentials from Azure Portal
 
 - **Connection String**
   ![Connection String](https://github.com/preedep/rust_azure_email_communication/blob/develop/images/image2.png)
 
 - **Sender address**
   ![Sender](https://github.com/preedep/rust_azure_email_communication/blob/develop/images/image1.png)
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.

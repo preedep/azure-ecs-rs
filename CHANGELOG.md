@@ -5,7 +5,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.2.0] — unreleased
+## [0.3.0] — unreleased
+
+### Added
+
+- **Batch send** — `ACSClient::send_emails_batch(emails: &[SentEmail]) -> Vec<Result<String, ACSError>>` dispatches all emails concurrently via `join_all` and returns results in input order. Errors are captured per-slot; a failed send does not abort sibling sends. All sends share the same `reqwest::Client` connection pool. ([ROADMAP Phase 7 #11])
+- **Cancellation support** — two new methods alongside the existing ones (backward-compatible):
+  - `send_email_stream_cancellable(email, token: CancellationToken)` — stream exits cleanly when the token is cancelled.
+  - `send_email_with_callback_cancellable(email, token, callback)` — background polling task exits cleanly; `done_rx` resolves once the task stops.
+  Both use `tokio::select!` to race the poll sleep against `token.cancelled()`, so a pre-cancelled token stops immediately without issuing any status requests. ([ROADMAP Phase 7 #12])
+- **`tokio-util`** added as a dependency (`CancellationToken` lives in `tokio_util::sync`).
+
+### Changed
+
+- **Pool-friendly `ACSClient::Clone`** — expanded module-level and struct-level documentation with build-once / clone-into-tasks examples. `ACSClient: Send + Sync` is now verified by a compile-time assertion test. ([ROADMAP Phase 7 #13])
+
+### Performance
+
+- **`HeaderSet` serialiser** — eliminated the intermediate `BTreeMap` allocation that occurred on every email send. The custom `Serialize` impl now uses `serialize_map` with a two-pass iterator count; no intermediate collection is allocated.
+- **`infer::get()`** — replaced `infer::Infer::new().get(buf)` with the `infer::get(buf)` free function in both `build()` and `build_async()`.
+- **Filename conversion** — replaced `.to_string_lossy().to_string()` (two steps) with `.to_string_lossy().into_owned()` (one step) in both attachment builders.
+- **Redundant clone removed** — `content_type.to_string()` in `build()` was called on a value already typed as `String`; replaced with a direct move.
+- **`String::new()`** — replaced `"".to_string()` in the SharedKey auth fallback path with the zero-allocation `String::new()`.
+- **Blocking I/O warning** — `EmailAttachmentBuilder::build()` doc now explicitly warns that it performs blocking `std::fs` I/O and must not be called from an async task; use `build_async()` instead.
+
+### Documentation
+
+- **CLAUDE.md** — added "Rust performance patterns" section covering allocation rules, async/blocking constraints, serialisation conventions, concurrency patterns, and a detailed zero-copy / memory layout guide with Bad/Good examples for each rule.
+
+---
+
+## [0.2.0] — 2026-05-09
 
 ### Added
 - **Typed errors** — `ACSError` enum (`Network`, `InvalidUrl`, `Serialization`, `Deserialization`, `Auth`, `Header`, `Api`, `MissingField`, `RateLimitExceeded`) via `thiserror`. Public API return type changes from `ErrorResponse` to `ACSError`. ([ROADMAP Phase 1])
