@@ -2926,9 +2926,7 @@ mod integration_tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "status": "Failed" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "Failed" })))
             .mount(&server)
             .await;
 
@@ -2951,9 +2949,11 @@ mod integration_tests {
         let email = minimal_email();
 
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500).set_body_json(
-                json!({ "error": { "code": "InternalError", "message": "boom" } }),
-            ))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(
+                    json!({ "error": { "code": "InternalError", "message": "boom" } }),
+                ),
+            )
             .mount(&server)
             .await;
 
@@ -3014,9 +3014,7 @@ mod integration_tests {
             .await;
         // First GET: Running; subsequent GETs: Succeeded
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "status": "Running" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "Running" })))
             .up_to_n_times(1)
             .mount(&server)
             .await;
