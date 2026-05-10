@@ -151,6 +151,9 @@ async fn send_email_with_api(
 
     debug!("Email request: {:#?}", email_request);
 
+    // To use API version 2025-09-01 instead of the default (2023-03-31):
+    //   use azure_ecs_rs::adapters::gateways::acs_email::ACSApiVersion;
+    //   acs_client_builder.api_version(ACSApiVersion::V20250901).build()
     let acs_client = acs_client_builder
         .build()
         .expect("Failed to build ACSClient");
