@@ -68,6 +68,21 @@ pub enum ACSError {
     /// Rate limit hit and all retries were exhausted.
     #[error("rate limit exceeded after {retries} retries")]
     RateLimitExceeded { retries: u32 },
+
+    /// [`send_email_and_wait`] did not observe a terminal status within the given timeout.
+    ///
+    /// [`send_email_and_wait`]: crate::adapters::gateways::acs_email::ACSClient::send_email_and_wait
+    #[error("timed out waiting for terminal delivery status")]
+    Timeout,
+
+    /// Polling was stopped early because the [`CancellationToken`] passed to
+    /// [`send_email_and_wait_cancellable`] was cancelled before a terminal
+    /// delivery status was observed.
+    ///
+    /// [`CancellationToken`]: tokio_util::sync::CancellationToken
+    /// [`send_email_and_wait_cancellable`]: crate::adapters::gateways::acs_email::ACSClient::send_email_and_wait_cancellable
+    #[error("polling cancelled by caller before terminal status was observed")]
+    Canceled,
 }
 
 impl From<ErrorResponse> for ACSError {

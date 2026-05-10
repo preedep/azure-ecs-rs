@@ -36,6 +36,48 @@ Rust SDK for the [Azure Email Communication Service](https://learn.microsoft.com
 | `ACSApiVersion::V20230331` | `2023-03-31` | Default — backward compatible |
 | `ACSApiVersion::V20250901` | `2025-09-01` | Latest stable — opt-in |
 
+## Choosing a Send Method
+
+The SDK exposes several send methods. Use this table to pick the right one for your situation.
+
+| Method | Use when |
+|---|---|
+| [`send_email`](#send-email) | You queue the email and track delivery yourself later (fire-and-queue). |
+| [`send_email_idempotent`](#idempotent-send) | Same as above, but your code may retry on network failure — the key prevents double-sends. |
+| [`send_emails_batch`](#batch-send) | You need to dispatch many emails concurrently in one call. |
+| [`send_email_and_wait`](#wait-for-terminal-status) | You want a single `await` that returns the final delivery status. Simplest option when you can afford to block the task. |
+| [`send_email_and_wait_cancellable`](#wait-with-cancellation) | Same as above, but inside a request handler or task that may be shut down early (e.g. axum, gRPC, CLI with Ctrl-C). |
+| [`send_email_stream`](#stream-based-status-polling) | You need to react to *each* status transition — progress UI, per-step logging, custom retry logic. |
+| [`send_email_stream_cancellable`](#stream-with-cancellation) | Same as above, but the consumer may abandon the stream before delivery completes. |
+| [`send_email_with_callback`](#callback-original-api-backward-compatible) | You want a background task to fire a closure on each status update (metrics, audit log). |
+| [`send_email_with_callback_cancellable`](#callback-with-cancellation) | Same as above, but the background task must stop cleanly on a shutdown signal. |
+
+**Decision flowchart**
+
+```
+Do you need delivery confirmation?
+├── No  → send_email (or send_email_idempotent if retries are needed)
+│
+└── Yes
+    │
+    ├── Many emails at once?
+    │   └── Yes → send_emails_batch
+    │
+    ├── Need to react to each status step?
+    │   ├── Yes → send_email_stream / send_email_stream_cancellable
+    │   └── No
+    │
+    ├── Need a side-effect callback per update (e.g. metrics)?
+    │   ├── Yes → send_email_with_callback / send_email_with_callback_cancellable
+    │   └── No
+    │
+    └── Just want a single await for the final status?
+        ├── No cancellation needed → send_email_and_wait
+        └── Must be stoppable (request context / shutdown) → send_email_and_wait_cancellable
+```
+
+> **Cancellation note:** cancellation only stops the *local wait/poll loop* — the email remains queued in ACS and may still be delivered. `ACSError::Canceled` distinguishes early abort from `ACSError::Timeout` (deadline elapsed) and from a real API error.
+
 ## Quick Start
 
 ### Build the client
@@ -196,6 +238,58 @@ let (operation_id, done_rx) = client
 let _ = done_rx.await;
 ```
 
+### Wait for terminal status
+
+Send and block until `Succeeded`, `Failed`, `Canceled`, or `Unknown` — no stream
+or callback needed. `ACSError::Timeout` is returned if no terminal state is
+observed within the deadline; the email may still be in transit.
+
+```rust
+use azure_ecs_rs::domain::entities::models::{ACSError, EmailSendStatusType};
+use std::time::Duration;
+
+match client.send_email_and_wait(&email, Duration::from_secs(60)).await {
+    Ok(EmailSendStatusType::Succeeded) => println!("delivered"),
+    Ok(EmailSendStatusType::Failed)    => eprintln!("delivery failed"),
+    Ok(status)                         => println!("terminal: {status}"),
+    Err(ACSError::Timeout)             => eprintln!("timed out — email may still be in transit"),
+    Err(e)                             => eprintln!("error: {e}"),
+}
+```
+
+Use `.poll_interval(Duration)` on the builder to control how often status is
+polled (default: 5 s).
+
+### Wait with cancellation
+
+`send_email_and_wait_cancellable` adds a [`CancellationToken`] so an external
+signal — a shutdown handler, an HTTP request context, a test harness — can abort
+the wait without leaking the poll loop. The email stays queued in ACS and may
+still be delivered.
+
+```rust
+use tokio_util::sync::CancellationToken;
+use azure_ecs_rs::domain::entities::models::{ACSError, EmailSendStatusType};
+use std::time::Duration;
+
+let token = CancellationToken::new();
+
+// Cancel from another task at any time: token.cancel()
+
+match client
+    .send_email_and_wait_cancellable(&email, Duration::from_secs(60), token)
+    .await
+{
+    Ok(EmailSendStatusType::Succeeded) => println!("delivered"),
+    Err(ACSError::Canceled)            => eprintln!("wait cancelled — email may still deliver"),
+    Err(ACSError::Timeout)             => eprintln!("timed out"),
+    Err(e)                             => eprintln!("error: {e}"),
+    Ok(status)                         => println!("terminal: {status}"),
+}
+```
+
+[`CancellationToken`]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html
+
 ### Poll status manually
 
 ```rust
@@ -294,13 +388,14 @@ via `tracing-log`, so no changes are needed if you already use `pretty_env_logge
 | `cargo run --example mail_error_handling` | Typed `ACSError` matching |
 | `cargo run --example mail_retry_timeout` | Retry and timeout configuration |
 | `cargo run --example mail_stream` | Stream-based status polling |
+| `cargo run --example mail_wait` | `send_email_and_wait` + `send_email_and_wait_cancellable` |
 
 Prefix any example with `RUST_LOG=debug` to enable tracing output.
 
 ## Testing
 
 ```bash
-cargo test                          # 136 unit + wiremock tests — no credentials needed
+cargo test                          # 157 unit + wiremock tests — no credentials needed
 cargo test --test azure_e2e -- --include-ignored   # real Azure E2E (credentials required)
 ```
 

@@ -93,7 +93,6 @@ pub fn parse_endpoint(endpoint: &str) -> Result<EndPointParams, String> {
             debug!("Host name: {}", end_point_params.host_name);
         } else if let Some(key) = param.strip_prefix("accesskey=") {
             end_point_params.access_key = key.to_string();
-            debug!("Access key: {}", end_point_params.access_key);
         } else {
             return Err("Invalid parameter in connection string".to_string());
         }
