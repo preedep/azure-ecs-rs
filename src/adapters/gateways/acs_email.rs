@@ -220,7 +220,12 @@ impl Default for ACSClientBuilder {
 }
 
 impl ACSClientBuilder {
-    // Create a new builder instance
+    /// Create a new builder with default settings.
+    ///
+    /// Equivalent to `ACSClientBuilder::default()`.  Configure the builder with
+    /// the chained setters below, then call [`build`] to obtain an [`ACSClient`].
+    ///
+    /// [`build`]: ACSClientBuilder::build
     pub fn new() -> Self {
         ACSClientBuilder {
             host: None,
@@ -242,6 +247,11 @@ impl ACSClientBuilder {
         self
     }
 
+    /// Select the ACS REST API version used for all requests on the built client.
+    ///
+    /// The default is [`ACSApiVersion::V20230331`] for backward compatibility.
+    /// Use [`ACSApiVersion::V20250901`] when you need explicit version pinning.
+    /// Both versions expose identical data-plane operations.
     pub fn api_version(mut self, version: ACSApiVersion) -> Self {
         self.api_version = version;
         self
@@ -276,19 +286,48 @@ impl ACSClientBuilder {
         self
     }
 
-    // Set the host for the client
+    /// Set the ACS resource hostname or full URL.
+    ///
+    /// Required when authenticating with [`service_principal`] or
+    /// [`managed_identity`].  Accepts either a bare hostname
+    /// (`"myresource.communication.azure.com"`) or a full `https://` URL —
+    /// the scheme prefix is stripped before use.
+    ///
+    /// Not needed when using [`connection_string`], which carries the host
+    /// inside the connection string value.
+    ///
+    /// [`service_principal`]: ACSClientBuilder::service_principal
+    /// [`managed_identity`]: ACSClientBuilder::managed_identity
+    /// [`connection_string`]: ACSClientBuilder::connection_string
     pub fn host(mut self, host: &str) -> Self {
         self.host = Some(host.to_string());
         self
     }
 
-    // Set the authentication method for the client using a shared key
+    /// Configure Shared Key authentication from an ACS connection string.
+    ///
+    /// The connection string has the form
+    /// `endpoint=https://<resource>.communication.azure.com;accesskey=<base64-key>`
+    /// and can be copied directly from the Azure Portal → Keys blade.
+    ///
+    /// Setting this option makes [`host`] unnecessary — the endpoint is
+    /// extracted from the connection string.
+    ///
+    /// [`host`]: ACSClientBuilder::host
     pub fn connection_string(mut self, connection_string: &str) -> Self {
         self.connection_string = Some(connection_string.to_string());
         self
     }
 
-    // Set the authentication method for the client using a service principal
+    /// Configure Service Principal (client-credentials) authentication.
+    ///
+    /// An OAuth2 client-credentials token is fetched from Azure AD on every
+    /// request using the supplied `tenant_id`, `client_id`, and
+    /// `client_secret`.  Tokens are not cached between requests.
+    ///
+    /// Requires [`host`] to also be set.
+    ///
+    /// [`host`]: ACSClientBuilder::host
     pub fn service_principal(
         mut self,
         tenant_id: &str,
@@ -303,13 +342,36 @@ impl ACSClientBuilder {
         self
     }
 
-    // Set the authentication method for the client using managed identity
+    /// Configure Managed Identity authentication.
+    ///
+    /// An ambient token is obtained from the Azure Instance Metadata Service
+    /// (IMDS) on every request.  This works inside Azure VMs, App Services,
+    /// Container Apps, AKS pods with a workload identity, and any other
+    /// environment where a managed identity is assigned.  No credentials need
+    /// to be stored in code or environment variables.
+    ///
+    /// Requires [`host`] to also be set.
+    ///
+    /// [`host`]: ACSClientBuilder::host
     pub fn managed_identity(mut self) -> Self {
         self.auth_method = Some(ACSAuthMethod::ManagedIdentity);
         self
     }
 
-    // Build and return the ACSClient
+    /// Validate the configuration and build an [`ACSClient`].
+    ///
+    /// Constructs the shared [`reqwest::Client`] (including TLS) once.  All
+    /// subsequent calls on the returned [`ACSClient`] — and all of its clones
+    /// — reuse this client, amortising connection setup across requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` when:
+    /// - The connection string is present but malformed.
+    /// - Neither a connection string nor a host was provided.
+    /// - A host was provided but no authentication method was set.
+    /// - The underlying HTTP client could not be built (rare; usually a TLS
+    ///   configuration issue).
     pub fn build(self) -> Result<ACSClient, String> {
         let mut client_builder = Client::builder();
         if let Some(timeout) = self.timeout {
@@ -905,15 +967,11 @@ fn wrap_http_client(client: &Client) -> Arc<dyn HttpClient> {
     Arc::new(client.clone()) as Arc<dyn HttpClient>
 }
 
-/// Get an access token based on the provided authentication method.
+/// Acquire a bearer token for the given authentication method.
 ///
-/// # Arguments
-///
-/// * `auth_method` - A reference to the `ACSAuthMethod` enum specifying the authentication method.
-///
-/// # Returns
-///
-/// * `Result<String, String>` - The result of the token acquisition, containing the token if successful.
+/// Returns an empty string for `SharedKey` (auth is handled via HMAC headers
+/// instead).  For `ServicePrincipal` and `ManagedIdentity` the token is
+/// fetched from Azure AD / IMDS on every call — responses are not cached.
 async fn get_access_token(
     http_client: &Client,
     auth_method: &ACSAuthMethod,
@@ -955,19 +1013,12 @@ async fn get_access_token(
     Ok(String::new())
 }
 
-/// Create headers for the request based on the provided authentication method.
+/// Build the required HTTP headers for a single request.
 ///
-/// # Arguments
-///
-/// * `url_endpoint` - A reference to the `Url` struct representing the endpoint URL.
-/// * `method` - A reference to the HTTP method string.
-/// * `request_id` - A reference to the request ID string.
-/// * `json_body` - A reference to the JSON body string.
-/// * `auth_method` - A reference to the `ACSAuthMethod` enum specifying the authentication method.
-///
-/// # Returns
-///
-/// * `EmailResult<reqwest::header::HeaderMap>` - The result of the header creation, containing the headers if successful.
+/// For `SharedKey` auth the full HMAC-SHA256 header set is computed via
+/// `acs_shared_key`.  For `ServicePrincipal` / `ManagedIdentity` a bearer
+/// token is fetched and `Authorization`, `Content-Type`, and
+/// `x-ms-client-request-id` headers are set.
 async fn create_headers(
     http_client: &Client,
     url_endpoint: &Url,
@@ -1005,16 +1056,6 @@ async fn create_headers(
     Ok(headers)
 }
 
-/// Convert an error into an `ErrorResponse`.
-///
-/// # Arguments
-///
-/// * `message` - A reference to the error message string.
-/// * `error` - An object that implements the `ToString` trait.
-///
-/// # Returns
-///
-/// * `ErrorResponse` - The error response containing the error details.
 fn network_err(detail: impl ToString) -> ACSError {
     ACSError::Network(detail.to_string())
 }
@@ -1039,17 +1080,7 @@ fn auth_err(detail: impl ToString) -> ACSError {
     ACSError::Auth(detail.to_string())
 }
 
-/// Get the status of a sent email using the ACS client.
-///
-/// # Arguments
-///
-/// * `base_url` - Base URL including scheme, e.g. `https://resource.communication.azure.com`.
-/// * `acs_auth_method` - A reference to the `ACSAuthMethod` enum specifying the authentication method.
-/// * `request_id` - A reference to the request ID string.
-///
-/// # Returns
-///
-/// * `EmailResult<EmailSendStatusType>` - The result of the email status query, containing the status if successful.
+/// Fetch the current delivery status for a single ACS operation ID.
 #[instrument(skip(http_client, acs_auth_method), fields(base_url = %base_url))]
 async fn acs_get_email_status(
     http_client: &Client,
@@ -1106,18 +1137,12 @@ fn build_repeatability_headers(
     Some(headers)
 }
 
-/// Send an email using the ACS client.
+/// POST a single email to the ACS `emails:send` endpoint and return the operation ID.
 ///
-/// # Arguments
-///
-/// * `base_url` - Base URL including scheme, e.g. `https://resource.communication.azure.com`.
-/// * `acs_auth_method` - A reference to the `ACSAuthMethod` enum specifying the authentication method.
-/// * `request_id` - A reference to the request ID string.
-/// * `email` - A reference to the `SentEmail` struct containing the email details.
-///
-/// # Returns
-///
-/// * `EmailResult<String>` - The result of the email send operation, containing the message ID if successful.
+/// Handles the initial request and delegates retry / backoff logic to
+/// [`handle_response_and_retry_if_needed`].  When `idempotency_key` is `Some`,
+/// the `repeatability-request-id` and `repeatability-first-sent` headers are
+/// included on the initial request and all retries.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(http_client, acs_auth_method, email, idempotency_key), fields(base_url = %base_url, max_retries = %max_retries))]
 async fn acs_send_email(
@@ -1161,21 +1186,13 @@ async fn acs_send_email(
     )
     .await
 }
-/// Handle the response from the email send operation and retry if needed.
+/// Inspect an HTTP response and retry on `429` / `503` up to `max_retries` times.
 ///
-/// # Arguments
-///
-/// * `response` - The `reqwest::Response` object.
-/// * `method` - The HTTP method used for the request.
-/// * `url` - The URL to send the request to.
-/// * `request_id` - The request ID string.
-/// * `body` - An optional reference to the request body.
-/// * `acs_auth_method` - A reference to the `ACSAuthMethod` enum specifying the authentication method.
-/// * `max_retries` - The maximum number of retries.
-///
-/// # Returns
-///
-/// * `EmailResult<String>` - The result of the response handling, containing the message ID if successful.
+/// On `202 Accepted` the operation ID is extracted from the response body.
+/// On `429 Too Many Requests` or `503 Service Unavailable` the request is
+/// retried after the delay specified in the `Retry-After` header, or after
+/// exponential backoff (`2^n` seconds) when that header is absent.
+/// Any other status code is treated as a permanent failure.
 #[allow(clippy::too_many_arguments)]
 async fn handle_response_and_retry_if_needed<T>(
     http_client: &Client,
@@ -1252,15 +1269,7 @@ where
     }
 }
 
-/// Parse the response from the email send operation.
-///
-/// # Arguments
-///
-/// * `response` - The `reqwest::Response` object.
-///
-/// # Returns
-///
-/// * `EmailResult<T>` - The result of the response parsing, containing the parsed response if successful.
+/// Deserialize a successful response body into `T`.
 async fn parse_response<T>(response: reqwest::Response) -> EmailResult<T>
 where
     T: serde::de::DeserializeOwned,
@@ -1268,15 +1277,7 @@ where
     response.json::<T>().await.map_err(parse_err)
 }
 
-/// Parse the error response from the email send operation.
-///
-/// # Arguments
-///
-/// * `response` - The `reqwest::Response` object.
-///
-/// # Returns
-///
-/// * `EmailResult<String>` - The result of the error response parsing, containing the error response if successful.
+/// Deserialize an error response body and return it as `Err(ACSError::Api)`.
 async fn parse_error_response(response: reqwest::Response) -> EmailResult<String> {
     let error_response = parse_response::<ErrorResponse>(response).await?;
     Err(ACSError::from(error_response))
