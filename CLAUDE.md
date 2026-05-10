@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                                          # build
-cargo test                                           # run all 136 tests (unit + integration)
+cargo test                                           # run all 157 tests (unit + integration)
 cargo clippy -- -D warnings                          # lint (must pass clean for CI)
 cargo fmt --check                                    # format check (must pass clean for CI)
 cargo test <name>                                    # run a single test by name substring
@@ -20,6 +20,7 @@ cargo clippy                                         # lint
 cargo run --example mail                             # sync example (shared key auth)
 cargo run --example mail_async                       # async example (service principal auth)
 cargo run --example mail_attach                      # async example with attachments
+cargo run --example mail_wait                        # send_email_and_wait + send_email_and_wait_cancellable
 RUST_LOG=debug cargo run --example mail              # with debug logging
 ```
 
@@ -42,7 +43,7 @@ Inline in each module under `#[cfg(test)]`:
 
 | Module | What is tested |
 |---|---|
-| `acs_email.rs` | `ACSApiVersion` variants/default, `ACSClientBuilder` all construction paths + `host()` base-URL formation + error messages + `max_retries` + `timeout`, `parse_url`, `serialize_body`, all error helpers, `ACSError` Display/From/RateLimitExceeded, `wrap_http_client`, `is_terminal_status` all variants |
+| `acs_email.rs` | `ACSApiVersion` variants/default, `ACSClientBuilder` all construction paths + `host()` base-URL formation + error messages + `max_retries` + `timeout` + `poll_interval`, `parse_url`, `serialize_body`, all error helpers, `ACSError` Display/From/RateLimitExceeded/Timeout/Canceled, `wrap_http_client`, `is_terminal_status` all variants, clone preserves all fields |
 | `acs_shared_key.rs` | `compute_content_sha256` known SHA-256 vectors, `compute_signature` (valid, invalid, determinism, divergence), `parse_endpoint` all error cases, `get_request_header` all required headers + HMAC-SHA256 Authorization scheme |
 | `models.rs` | `SentEmailBuilder` (success, all missing-field errors, optional fields, `reply_to` with real addresses + JSON serialization), `EmailAttachmentBuilder` sync + async (`build_async`: valid file, missing file, MIME detection for PNG/octet-stream, filename extraction), `EmailSendStatusType` Display + `FromStr` all variants, `EmailSendStatus` Display + `to_type`, `HeaderSet` serde round-trip, `SentEmail` JSON serialization, tracing subscriber smoke test |
 
@@ -62,6 +63,20 @@ Live in `mod integration_tests` inside `acs_email.rs`. Use `wiremock` to start a
 | `send_email_stream_returns_error_when_send_fails` | Send 500 → stream itself returns `Err` before yielding |
 | `send_email_stream_yields_terminal_status_and_stops` | Send 202, status Succeeded → stream yields one item then terminates |
 | `send_email_stream_stops_on_status_error` | Send 202, status 404 → stream yields `Err` then terminates |
+| `send_email_and_wait_returns_terminal_status` | Send 202, status Succeeded → `Ok(Succeeded)` |
+| `send_email_and_wait_times_out` | Send 202, status always Running, poll_interval > timeout → `ACSError::Timeout` |
+| `send_email_and_wait_returns_failed_status` | Send 202, status Failed → `Ok(Failed)` |
+| `send_email_and_wait_send_fails_returns_send_error` | Send 500 → `ACSError::Api` (not Timeout) |
+| `send_email_and_wait_poll_error_propagates` | Send 202, status 404 → `ACSError::Api` (not Timeout) |
+| `send_email_and_wait_running_then_succeeded` | Running then Succeeded sequence → `Ok(Succeeded)` |
+| `send_email_and_wait_cancellable_returns_terminal_status` | Token never fired → succeeds normally |
+| `send_email_and_wait_cancellable_returns_canceled_when_token_fires` | Token cancelled mid-wait → `ACSError::Canceled` |
+| `send_email_and_wait_cancellable_already_cancelled_returns_canceled` | Pre-cancelled token → `ACSError::Canceled` immediately |
+| `send_email_and_wait_cancellable_times_out_before_cancel` | Deadline elapses before token → `ACSError::Timeout` |
+| `send_email_and_wait_cancellable_send_fails_returns_send_error` | Send 500 → `ACSError::Api` |
+| `send_email_idempotent_sends_repeatability_headers` | `repeatability-request-id` + `repeatability-first-sent` present in request |
+| `send_email_idempotent_returns_operation_id` | Returns ID from 202 body |
+| `send_email_idempotent_retries_on_429_preserves_key` | 429 then 202 — idempotency header present on retry |
 
 **How it works:** `ACSClientBuilder` has a `#[cfg(test)] pub(crate) fn base_url_override(url: &str)` method that replaces the computed `https://<host>` with the wiremock server URI. Auth headers are computed with a dummy shared key; the mock server ignores them.
 
@@ -105,18 +120,26 @@ src/
 
 ### Key types
 
-- **`ACSClient`** (`acs_email.rs`) — built via `ACSClientBuilder`. Holds auth method, base URL, shared `reqwest::Client`, and API version. Public API:
-  - `send_email(email: &SentEmail) -> Result<String, ACSError>`
-  - `send_email_with_callback(email, cb) -> Result<(String, Receiver<()>), ACSError>` — polls via tokio task, fires callback on each status update
-  - `get_email_status(operation_id: &str) -> Result<EmailSendStatusType, ACSError>`
+- **`ACSClient`** (`acs_email.rs`) — built via `ACSClientBuilder`. Holds auth method, base URL, shared `reqwest::Client`, API version, and poll interval. Public API:
+  - `send_email(email) -> Result<String, ACSError>` — queue and return operation ID
+  - `send_email_idempotent(email, key) -> Result<String, ACSError>` — queue with `repeatability-request-id` / `repeatability-first-sent` headers
+  - `send_email_and_wait(email, timeout) -> Result<EmailSendStatusType, ACSError>` — send + poll until terminal or deadline
+  - `send_email_and_wait_cancellable(email, timeout, token) -> Result<EmailSendStatusType, ACSError>` — same, stoppable via `CancellationToken`
+  - `send_emails_batch(emails) -> Vec<Result<String, ACSError>>` — concurrent multi-send
+  - `send_email_stream(email) -> Result<(String, impl Stream<…>), ACSError>` — per-status stream
+  - `send_email_stream_cancellable(email, token) -> Result<(String, impl Stream<…>), ACSError>`
+  - `send_email_with_callback(email, cb) -> Result<(String, Receiver<()>), ACSError>`
+  - `send_email_with_callback_cancellable(email, token, cb) -> Result<(String, Receiver<()>), ACSError>`
+  - `get_email_status(operation_id) -> Result<EmailSendStatusType, ACSError>`
 
-- **`ACSError`** (`models.rs`) — typed error enum via `thiserror`. Variants: `Network`, `InvalidUrl`, `Serialization`, `Deserialization`, `Auth`, `Header`, `Api { code, message }`, `MissingField`, `RateLimitExceeded { retries }`.
+- **`ACSError`** (`models.rs`) — typed error enum via `thiserror`. Variants: `Network`, `InvalidUrl`, `Serialization`, `Deserialization`, `Auth`, `Header`, `Api { code, message }`, `MissingField`, `RateLimitExceeded { retries }`, `Timeout`, `Canceled`.
 
 - **`ACSApiVersion`** — `V20230331` (default) / `V20250901`. Set via `.api_version()` on the builder.
 
 - **`ACSClientBuilder`** — fluent builder implementing `Default`. Key options:
   - `.timeout(Duration)` — per-request HTTP timeout (default: none)
   - `.max_retries(u32)` — retries on 429/503 with exponential backoff (default: 3)
+  - `.poll_interval(Duration)` — delay between status polls in `send_email_and_wait*`, `send_email_stream*`, and callback variants (default: 5 s)
   - `.api_version(ACSApiVersion)` — API version (default: `V20230331`)
 
 - **`SentEmail`** / **`SentEmailBuilder`** — top-level email object. Builder implements `Default`. Composes `EmailContent`, `Recipients`, optional `Vec<EmailAttachment>`.

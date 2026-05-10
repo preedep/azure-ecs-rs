@@ -7,9 +7,9 @@
 //! - [`ACSClient`] — clone-cheap handle (all fields behind `Arc` or `Clone`).
 //!   Owns the HTTP client and dispatches the public operations:
 //!   [`send_email`], [`send_email_idempotent`], [`send_email_and_wait`],
-//!   [`send_emails_batch`], [`send_email_with_callback`],
-//!   [`send_email_with_callback_cancellable`], [`send_email_stream`],
-//!   [`send_email_stream_cancellable`], and [`get_email_status`].
+//!   [`send_email_and_wait_cancellable`], [`send_emails_batch`],
+//!   [`send_email_with_callback`], [`send_email_with_callback_cancellable`],
+//!   [`send_email_stream`], [`send_email_stream_cancellable`], and [`get_email_status`].
 //!
 //! # Pool-friendly usage
 //!
@@ -59,6 +59,7 @@
 //! [`send_email`]: ACSClient::send_email
 //! [`send_email_idempotent`]: ACSClient::send_email_idempotent
 //! [`send_email_and_wait`]: ACSClient::send_email_and_wait
+//! [`send_email_and_wait_cancellable`]: ACSClient::send_email_and_wait_cancellable
 //! [`send_emails_batch`]: ACSClient::send_emails_batch
 //! [`send_email_with_callback`]: ACSClient::send_email_with_callback
 //! [`send_email_with_callback_cancellable`]: ACSClient::send_email_with_callback_cancellable
@@ -618,6 +619,51 @@ impl ACSClient {
                 let status = self.get_email_status(&operation_id).await?;
                 if is_terminal_status(&status) {
                     return Ok(status);
+                }
+            }
+        })
+        .await
+        .map_err(|_| ACSError::Timeout)?
+    }
+
+    /// Send an email and block until terminal status, timeout, or cancellation.
+    ///
+    /// Identical to [`send_email_and_wait`] but adds cooperative cancellation via
+    /// a [`CancellationToken`].  When the token is cancelled before a terminal
+    /// status is observed the method returns [`ACSError::Canceled`] immediately,
+    /// without issuing another status poll.  If the deadline elapses first,
+    /// [`ACSError::Timeout`] is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// - [`ACSError::Canceled`] — `token` was cancelled before terminal status.
+    /// - [`ACSError::Timeout`] — `timeout` elapsed before terminal status.
+    /// - All errors from [`send_email`] and [`get_email_status`].
+    ///
+    /// [`send_email_and_wait`]: ACSClient::send_email_and_wait
+    /// [`send_email`]: ACSClient::send_email
+    /// [`get_email_status`]: ACSClient::get_email_status
+    /// [`CancellationToken`]: tokio_util::sync::CancellationToken
+    #[instrument(skip(self, email, token), fields(host = %self.host, api_version = %self.api_version.as_str()))]
+    pub async fn send_email_and_wait_cancellable(
+        &self,
+        email: &SentEmail,
+        timeout: Duration,
+        token: CancellationToken,
+    ) -> EmailResult<EmailSendStatusType> {
+        let operation_id = self.send_email(email).await?;
+        tokio::time::timeout(timeout, async {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        return Err(ACSError::Canceled);
+                    }
+                    _ = sleep(self.poll_interval) => {
+                        let status = self.get_email_status(&operation_id).await?;
+                        if is_terminal_status(&status) {
+                            return Ok(status);
+                        }
+                    }
                 }
             }
         })
@@ -1460,6 +1506,13 @@ mod tests {
         let e = ACSError::Timeout;
         let s = e.to_string();
         assert!(s.contains("timed out"));
+    }
+
+    #[test]
+    fn acs_error_display_canceled() {
+        let e = ACSError::Canceled;
+        let s = e.to_string();
+        assert!(s.contains("cancel"));
     }
 
     #[test]
@@ -3036,5 +3089,162 @@ mod integration_tests {
             .send_email_and_wait(&email, Duration::from_secs(5))
             .await;
         assert!(matches!(result, Ok(EmailSendStatusType::Succeeded)));
+    }
+
+    // ── send_email_and_wait_cancellable ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_email_and_wait_cancellable_returns_terminal_status() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "op-cancellable-ok" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "status": "Succeeded" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let result = client
+            .send_email_and_wait_cancellable(&email, Duration::from_secs(5), token)
+            .await;
+        assert!(matches!(result, Ok(EmailSendStatusType::Succeeded)));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_cancellable_returns_canceled_when_token_fires() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "op-cancellable-tok" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "Running" })))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_secs(60)) // longer than cancel fires
+            .build()
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        // Cancel after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token_clone.cancel();
+        });
+
+        let result = client
+            .send_email_and_wait_cancellable(&email, Duration::from_secs(5), token)
+            .await;
+        assert!(matches!(result, Err(ACSError::Canceled)));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_cancellable_already_cancelled_returns_canceled() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "op-precancelled" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
+
+        let token = CancellationToken::new();
+        token.cancel(); // pre-cancelled before the call
+
+        let result = client
+            .send_email_and_wait_cancellable(&email, Duration::from_secs(5), token)
+            .await;
+        assert!(matches!(result, Err(ACSError::Canceled)));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_cancellable_times_out_before_cancel() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(json!({ "id": "op-timeout-wins" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "Running" })))
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .poll_interval(Duration::from_secs(60))
+            .build()
+            .unwrap();
+
+        let token = CancellationToken::new(); // never cancelled
+        let result = client
+            .send_email_and_wait_cancellable(&email, Duration::from_millis(50), token)
+            .await;
+        assert!(matches!(result, Err(ACSError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn send_email_and_wait_cancellable_send_fails_returns_send_error() {
+        let server = MockServer::start().await;
+        let email = minimal_email();
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(
+                    json!({ "error": { "code": "InternalError", "message": "boom" } }),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ACSClientBuilder::new()
+            .connection_string(FAKE_CONN)
+            .base_url_override(&server.uri())
+            .max_retries(0)
+            .build()
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let result = client
+            .send_email_and_wait_cancellable(&email, Duration::from_secs(5), token)
+            .await;
+        assert!(matches!(result, Err(ACSError::Api { .. })));
     }
 }
